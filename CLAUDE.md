@@ -6,13 +6,41 @@ Guidance for Claude when working on this repository.
 
 A multi-tenant billing API built in Django. It charges companies monthly, keeps
 each company's data isolated, and never double-charges. The full spec is a
-six-phase build (data model, core endpoints, idempotent payments, multi-tenancy,
-tests + docs, deploy).
+six-phase build (data model + Docker, core endpoints, idempotent payments,
+multi-tenancy + worker, tests + docs, deploy).
 
-Current status: Phase 1 (data model) is complete and verified. All seven tables
-exist, migrations apply cleanly, `manage.py check` is clean, and shell checks
-pass for choices validity, reverse accessors, both unique constraints, ledger
-balancing, tenant isolation, and PROTECT behavior.
+## Phase gating — read this first
+
+**Do not start work on a phase until the previous phase meets its "Done when"
+in full.** Each phase has an explicit completion condition, and the schema being
+in place is not the same as the phase being finished. If the author asks for
+Phase N work while Phase N-1 is incomplete, say so and name the specific
+remaining item rather than going along with it.
+
+| Phase | "Done when" | Status |
+|---|---|---|
+| 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **In progress** |
+| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | Blocked on 1 |
+| 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
+| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
+| 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
+| 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
+
+### What Phase 1 still needs
+
+The **data model half is done and verified**: all seven tables exist, both
+migrations apply, `manage.py check` is clean, and shell checks pass for choices
+validity, reverse accessors, both unique constraints, ledger balancing, tenant
+isolation, and PROTECT behavior. `0001_initial.py` confirmed to contain
+`unique_invoice_period`, `unique_key_per_tenant`, and the `LedgerEntry` index.
+
+The **infrastructure half has not started**:
+
+- No `Dockerfile`, no `docker-compose.yml`, no `.dockerignore`. The Done-when is
+  literally `docker compose up` — that command does not exist yet.
+- No `requirements.txt`. Needed by both the Docker build and Phase 5 CI. The
+  venv currently holds only Django 6.0.7, asgiref, sqlparse.
+- Still on SQLite. The Postgres transition is the author's declared next task.
 
 ## How to work with me on this
 
@@ -29,6 +57,9 @@ This is a learning project. The author is building it themselves on purpose.
 - One clear next action at a time is better than a wall of changes.
 - It is fine to run code to verify the author's work and report what passed or
   failed. Verifying is not the same as writing it for them.
+- When the author reports having done something, verify the actual state rather
+  than taking it as done. Report what is genuinely correct before what is not —
+  a commit that half-worked is not a failure.
 
 ## Locked conventions
 
@@ -96,6 +127,9 @@ client error, not a replay.
 Keys are scoped per tenant. The same key string under two different tenants is
 allowed and must not collide.
 
+The Phase 3 deliverable is the two curl commands and their output. Capture them
+when the endpoint works; they are the demo.
+
 ## Testing conventions
 
 Wrap each expected-failure insert in `with transaction.atomic():`. Postgres
@@ -107,29 +141,84 @@ The three required tests (Phase 5) map directly to Phase 1 shell checks:
 double-pay charges once, tenant A cannot read or affect tenant B, ledger sums
 to zero.
 
+## Open design decisions
+
+These block or shape later phases. Raise them at the right phase; do not decide
+them unilaterally.
+
+1. **How a request identifies its tenant.** `Tenant` has no API key, no token,
+   and no link to `django.contrib.auth.User`. There is currently no way to
+   answer "who is calling?", and Phases 2, 3, and 4 all depend on that answer.
+   This is the largest open gap. Settle it before writing Phase 2 endpoints.
+2. **Where business logic lives.** Invoice generation is called from two places:
+   the Phase 2 API endpoint and the Phase 4 background worker (which has no HTTP
+   request). Same for the payment/ledger atomic block. If that logic goes inside
+   a view, Phase 4 forces a rewrite. A `billing/services.py` that both views and
+   tasks call avoids it. Decide before writing views, not after.
+3. **One invoice per tenant, or per subscription?** `Invoice` links to `Tenant`
+   only, but amount derives from `Plan` via `Subscription`. With one active
+   subscription per tenant this is unambiguous; with several it is not.
+
 ## Known open items
 
+Blocking Phase 1:
+- No Docker Compose stack (API + Postgres). This is the phase's Done-when.
+- No `requirements.txt`.
+- Still on SQLite (`db.sqlite3`); the Postgres transition is planned and is the
+  author's declared next task. Until it happens, the expected-failure tests
+  described under "Testing conventions" pass for the wrong reason, and `Decimal`
+  trailing-zeros noise is expected.
+
+Needed before Phase 6 deploy, cheapest to do alongside the Docker work:
+- `config/settings.py` is stock `startproject`: hardcoded `SECRET_KEY`,
+  `DEBUG=True`, empty `ALLOWED_HOSTS`. Docker needs env-var config anyway, so
+  doing it now costs nothing extra.
+
+Schema and code cleanups:
 - Invoice period uniqueness is enforced on exact `period_start` / `period_end`
   timestamps. If the Phase 4 worker derives these from `timezone.now()`, two
   runs microseconds apart will NOT collide and a duplicate invoice slips
   through. Normalize period boundaries before saving (truncate to a day
   boundary, or switch those fields to `DateField`).
+- Nothing prevents attaching a `UsageEvent` to an `Invoice` belonging to a
+  different tenant — `UsageEvent` reaches tenant only via `subscription.tenant`,
+  and `invoice` is an independent FK. Needs a validation check in the invoice
+  generator.
+- `billing/url.py` is empty and misnamed; Django and `config/urls.py` expect
+  `urls.py`. Rename while it is still empty.
+- `Subscription.status` has no default, while `Plan.interval` and
+  `IdempotencyKey.state` do.
 - No `__str__` on any model yet. Add short ones to make shell debugging
   readable.
+- `billing/admin.py` registers nothing. Registering the seven models gives a
+  clickable UI for inspecting tenants, invoices, and ledger rows during Phases
+  2–3.
 - Consider migrating existing choice sets to `TextChoices`.
-- The project still runs on SQLite (`db.sqlite3`); the Postgres switch is
-  planned but deferred. Until it happens, the expected-failure tests described
-  under "Testing conventions" pass for the wrong reason, and `Decimal`
-  trailing-zeros noise is expected.
+- DRF is not installed. Phase 2 endpoints and Phase 5 Swagger both need it.
 
 ## Commands
 
+The venv is at `.venv/` and is not activated automatically:
+
 ```
-python manage.py makemigrations
-python manage.py migrate
-python manage.py check
+.venv/bin/python manage.py makemigrations
+.venv/bin/python manage.py migrate
+.venv/bin/python manage.py check
+.venv/bin/python manage.py test
 ```
 
 After generating a migration, confirm it contains the two `AddConstraint`
 operations (`unique_invoice_period`, `unique_key_per_tenant`) and the
 `LedgerEntry` index before applying.
+
+## Repository hygiene
+
+`.gitignore` covers `.venv/`, `__pycache__/`, `*.pyc`, `db.sqlite3`, `.env`.
+Tracked file count should stay around 18 — if it jumps, something got committed
+that shouldn't have been.
+
+Note that `.gitignore` only affects **untracked** files; anything already in the
+index keeps being tracked until `git rm -r --cached` removes it. The `.venv` and
+`db.sqlite3` blobs still exist in the older commits `e8166d4` and `41fb8c3`.
+Purging them would mean rewriting all history — not worth it here, and nothing
+new is being added.
