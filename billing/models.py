@@ -1,9 +1,17 @@
 from django.db import models
 import uuid
+import secrets
 
 # Create your models here.
+
+def make_key():
+    api_key = secrets.token_urlsafe(32)
+    return api_key
+
+
 class Tenant(models.Model):
     name = models.CharField(max_length=32)
+    api_key = models.CharField(max_length=256, unique=True, default=make_key)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

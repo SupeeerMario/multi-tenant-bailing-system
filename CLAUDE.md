@@ -20,7 +20,7 @@ remaining item rather than going along with it.
 | Phase | "Done when" | Status |
 |---|---|---|
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
-| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **Next** |
+| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **In progress** — tenant auth field done, DRF not installed |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
@@ -44,9 +44,28 @@ The **infrastructure half**, confirmed by running the stack:
   Postgres. Named volume `multi-tenant-bailing-system_db` persists them.
 - Postgres logs are clean — 0 `FATAL` lines.
 
-Deferred out of Phase 1 deliberately: `requirements.txt` still lists the bogus
-`dotenv==0.9.9` (the real package is `python-dotenv`, also listed) — drop it
-before Phase 5 CI pins it.
+### Phase 2 — where it stands (2026-07-30)
+
+Done:
+
+- `Tenant.api_key` — `CharField(max_length=256, unique=True, default=make_key)`.
+  `make_key()` returns `secrets.token_urlsafe(32)`, which is 43 characters and
+  256 bits of entropy. Migration `0003_tenant_api_key` generated and applied;
+  confirmed it serializes `default=billing.models.make_key`, the **callable**,
+  so every row gets a fresh key. Verified live: two tenants, two distinct keys.
+- Note on the length argument: `token_urlsafe(n)` takes **bytes of entropy**, not
+  output characters. Base64 expands ~4/3, so `token_urlsafe(256)` returns 342
+  chars and overflows `varchar(256)`.
+
+Not started, in order:
+
+1. Install DRF — add to `requirements.txt` and `INSTALLED_APPS`. Nothing else in
+   Phase 2 can start first. A requirements change needs `up -d --build`; the bind
+   mount only shares source, and packages live in the image at `/usr/local`.
+2. Custom DRF authentication class reading the key from a request header and
+   setting `request.tenant`. Never log or echo the key.
+3. Rename `billing/url.py` to `urls.py` before wiring any routes.
+4. Create `billing/services.py` (open decision 2) before writing views.
 
 ## How to work with me on this
 
@@ -171,14 +190,22 @@ them unilaterally.
 ## Known open items
 
 Carried out of Phase 1:
-- `requirements.txt` lists `dotenv==0.9.9`, a squatter shim. The real dependency
-  is `python-dotenv`, already listed. Remove the bogus line.
 - Dockerfile `CMD` chains `migrate && runserver` via `sh -c`, so the shell is
   PID 1 and swallows `SIGTERM`. Fine for dev; Phase 6 wants a real entrypoint
   script and a WSGI server instead of `runserver`.
-- No bind mount for the code in `docker-compose.yml`, so every source edit needs
-  an image rebuild. Adding `.:/app` to `web` makes `runserver` autoreload work
-  and will save a lot of time during Phase 2.
+- `requirements.txt` lists `dotenv==0.9.9`. Cosmetic only — verified that package
+  ships **no Python module**, just `dist-info` metadata declaring a dependency on
+  `python-dotenv`. `from dotenv import load_dotenv` already resolves to
+  `python-dotenv 1.2.2`, which is listed directly. Removing it changes nothing
+  functionally; the reason to drop it is to stop installing an abandoned
+  third-party placeholder on every Docker build and CI run. Low priority.
+
+Resolved during Phase 2 setup:
+- Bind mount `.:/app` added to `web`. Before this, `docker compose exec web
+  python manage.py check` validated the **stale `COPY . .` snapshot** baked at
+  build time and reported "no issues" for code with a `NameError` in it. A green
+  check against a stale image is the worst failure mode in this stack — if a
+  result looks impossibly good, confirm the container sees your file first.
 
 Needed before Phase 6 deploy:
 - `config/settings.py` is stock `startproject`: hardcoded `SECRET_KEY`,
@@ -223,6 +250,13 @@ docker compose down
 
 `docker compose config` validates the compose file and prints resolved `${...}`
 values without starting anything. Use it before every `up`.
+
+`migrate` runs automatically on container start (it is in the Dockerfile `CMD`
+chain), but it only **applies** files already in `billing/migrations/` — it never
+reads the models. After editing a model you must run `makemigrations` yourself to
+generate the file. That stays manual on purpose: migrations are reviewed source
+code that gets committed, and auto-generating them per environment would produce
+conflicting numbering between dev, CI, and prod.
 
 Never `docker compose down -v` once there is data worth keeping — `-v` deletes
 the Postgres volume.
