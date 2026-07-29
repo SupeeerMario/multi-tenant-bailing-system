@@ -19,28 +19,34 @@ remaining item rather than going along with it.
 
 | Phase | "Done when" | Status |
 |---|---|---|
-| 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **In progress** |
-| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | Blocked on 1 |
+| 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
+| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **Next** |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
 | 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
 
-### What Phase 1 still needs
+### Phase 1 — what was verified
 
-The **data model half is done and verified**: all seven tables exist, both
-migrations apply, `manage.py check` is clean, and shell checks pass for choices
-validity, reverse accessors, both unique constraints, ledger balancing, tenant
-isolation, and PROTECT behavior. `0001_initial.py` confirmed to contain
+The **data model half**: all seven tables exist, both migrations apply,
+`manage.py check` is clean, and shell checks pass for choices validity, reverse
+accessors, both unique constraints, ledger balancing, tenant isolation, and
+PROTECT behavior. `0001_initial.py` confirmed to contain
 `unique_invoice_period`, `unique_key_per_tenant`, and the `LedgerEntry` index.
 
-The **infrastructure half has not started**:
+The **infrastructure half**, confirmed by running the stack:
 
-- No `Dockerfile`, no `docker-compose.yml`, no `.dockerignore`. The Done-when is
-  literally `docker compose up` — that command does not exist yet.
-- No `requirements.txt`. Needed by both the Docker build and Phase 5 CI. The
-  venv currently holds only Django 6.0.7, asgiref, sqlparse.
-- Still on SQLite. The Postgres transition is the author's declared next task.
+- `Dockerfile` (single stage, `python:3.13-slim`), `docker-compose.yml`,
+  `.dockerignore`, `requirements.txt` all in place.
+- `docker compose up -d --build` brings up `db` (healthy) and `web` on
+  `0.0.0.0:8000`. `/admin/` returns 302.
+- Migrations run on container start and create all seven `billing_*` tables in
+  Postgres. Named volume `multi-tenant-bailing-system_db` persists them.
+- Postgres logs are clean — 0 `FATAL` lines.
+
+Deferred out of Phase 1 deliberately: `requirements.txt` still lists the bogus
+`dotenv==0.9.9` (the real package is `python-dotenv`, also listed) — drop it
+before Phase 5 CI pins it.
 
 ## How to work with me on this
 
@@ -146,10 +152,13 @@ to zero.
 These block or shape later phases. Raise them at the right phase; do not decide
 them unilaterally.
 
-1. **How a request identifies its tenant.** `Tenant` has no API key, no token,
-   and no link to `django.contrib.auth.User`. There is currently no way to
-   answer "who is calling?", and Phases 2, 3, and 4 all depend on that answer.
-   This is the largest open gap. Settle it before writing Phase 2 endpoints.
+1. ~~**How a request identifies its tenant.**~~ **DECIDED 2026-07-30: API key on
+   `Tenant`.** Add a unique, indexed `api_key` field to `Tenant`, plus a custom
+   DRF authentication class that reads the key from a request header and resolves
+   `request.tenant`. No `django.contrib.auth.User` involvement. Rejected: linking
+   to `auth.User` (couples billing identity to user accounts and adds a signup
+   flow nothing needs yet), and passing the tenant id in the URL path (any caller
+   could pass any id, so Phase 4's isolation test would prove nothing).
 2. **Where business logic lives.** Invoice generation is called from two places:
    the Phase 2 API endpoint and the Phase 4 background worker (which has no HTTP
    request). Same for the payment/ledger atomic block. If that logic goes inside
@@ -161,15 +170,17 @@ them unilaterally.
 
 ## Known open items
 
-Blocking Phase 1:
-- No Docker Compose stack (API + Postgres). This is the phase's Done-when.
-- No `requirements.txt`.
-- Still on SQLite (`db.sqlite3`); the Postgres transition is planned and is the
-  author's declared next task. Until it happens, the expected-failure tests
-  described under "Testing conventions" pass for the wrong reason, and `Decimal`
-  trailing-zeros noise is expected.
+Carried out of Phase 1:
+- `requirements.txt` lists `dotenv==0.9.9`, a squatter shim. The real dependency
+  is `python-dotenv`, already listed. Remove the bogus line.
+- Dockerfile `CMD` chains `migrate && runserver` via `sh -c`, so the shell is
+  PID 1 and swallows `SIGTERM`. Fine for dev; Phase 6 wants a real entrypoint
+  script and a WSGI server instead of `runserver`.
+- No bind mount for the code in `docker-compose.yml`, so every source edit needs
+  an image rebuild. Adding `.:/app` to `web` makes `runserver` autoreload work
+  and will save a lot of time during Phase 2.
 
-Needed before Phase 6 deploy, cheapest to do alongside the Docker work:
+Needed before Phase 6 deploy:
 - `config/settings.py` is stock `startproject`: hardcoded `SECRET_KEY`,
   `DEBUG=True`, empty `ALLOWED_HOSTS`. Docker needs env-var config anyway, so
   doing it now costs nothing extra.
@@ -198,13 +209,30 @@ Schema and code cleanups:
 
 ## Commands
 
-The venv is at `.venv/` and is not activated automatically:
+The Docker stack is now the real environment — Postgres only exists inside it,
+so anything touching the database has to run there:
 
 ```
-.venv/bin/python manage.py makemigrations
-.venv/bin/python manage.py migrate
+docker compose up -d --build
+docker compose logs -f web
+docker compose exec web python manage.py makemigrations
+docker compose exec web python manage.py test
+docker compose exec db psql -U lamehabiba -d multi_tenant_bailing_system_db
+docker compose down
+```
+
+`docker compose config` validates the compose file and prints resolved `${...}`
+values without starting anything. Use it before every `up`.
+
+Never `docker compose down -v` once there is data worth keeping — `-v` deletes
+the Postgres volume.
+
+The venv at `.venv/` is not activated automatically and is now only good for
+offline checks that never touch the database (`manage.py check` will still fail
+on `DB_HOST=127.0.0.1` unless Postgres is reachable on the host):
+
+```
 .venv/bin/python manage.py check
-.venv/bin/python manage.py test
 ```
 
 After generating a migration, confirm it contains the two `AddConstraint`
@@ -214,8 +242,13 @@ operations (`unique_invoice_period`, `unique_key_per_tenant`) and the
 ## Repository hygiene
 
 `.gitignore` covers `.venv/`, `__pycache__/`, `*.pyc`, `db.sqlite3`, `.env`.
-Tracked file count should stay around 18 — if it jumps, something got committed
-that shouldn't have been.
+Tracked file count is 20 as of `ce7e443`, which added Phase 1's infra files
+(`Dockerfile`, `docker-compose.yml`, `.dockerignore`, `requirements.txt`) — if it
+jumps, something got committed that shouldn't have been.
+
+`.env` holds real credentials and is gitignored, but `docker-compose.yml`
+references it through `${...}` interpolation, so a fresh clone has no database
+config. Phase 6's README needs to say which keys are required.
 
 Note that `.gitignore` only affects **untracked** files; anything already in the
 index keeps being tracked until `git rm -r --cached` removes it. The `.venv` and

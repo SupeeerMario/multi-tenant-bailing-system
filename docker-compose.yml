@@ -27,7 +27,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    
+    volumes:
+      - .:/app
 
 volumes:
   db:
