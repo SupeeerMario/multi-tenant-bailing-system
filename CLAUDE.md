@@ -20,7 +20,7 @@ remaining item rather than going along with it.
 | Phase | "Done when" | Status |
 |---|---|---|
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
-| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **In progress** — tenant auth field done, DRF not installed |
+| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **In progress** — auth layer done, no endpoints yet |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
@@ -44,7 +44,7 @@ The **infrastructure half**, confirmed by running the stack:
   Postgres. Named volume `multi-tenant-bailing-system_db` persists them.
 - Postgres logs are clean — 0 `FATAL` lines.
 
-### Phase 2 — where it stands (2026-07-30)
+### Phase 2 — where it stands (2026-07-31)
 
 Done:
 
@@ -56,16 +56,52 @@ Done:
 - Note on the length argument: `token_urlsafe(n)` takes **bytes of entropy**, not
   output characters. Base64 expands ~4/3, so `token_urlsafe(256)` returns 342
   chars and overflows `varchar(256)`.
+- DRF installed — `djangorestframework==3.17.1` in `requirements.txt`,
+  `rest_framework` in `INSTALLED_APPS`. Confirmed importable **inside the
+  container**, which is the only check that counts after a requirements change.
+- `billing/url.py` renamed to `urls.py`, holds `urlpatterns = []`, and
+  `config/urls.py` includes it under `billing/`. An empty file is not enough —
+  `include()` imports the module and reads `urlpatterns`, so a missing name is
+  `ImproperlyConfigured`, raised lazily on the first request rather than at boot.
+- **Auth layer complete** (open decision 1). `billing/authenticate.py` holds
+  `TenantAuthentication(BaseAuthentication)` with `keyword = 'Api-Key'`,
+  `authenticate()`, and `authenticate_header()`. `Tenant.is_authenticated` is a
+  `@property` returning `True` (no migration — `makemigrations --check` reports
+  no changes). `REST_FRAMEWORK` in settings sets
+  `DEFAULT_AUTHENTICATION_CLASSES = ['billing.authenticate.TenantAuthentication']`
+  and `DEFAULT_PERMISSION_CLASSES = ['rest_framework.permissions.IsAuthenticated']`.
+
+  Verified end to end through real DRF dispatch (throwaway probe view in a shell,
+  not committed): no header → 401, bad key → 401, inactive tenant → 401, wrong
+  scheme → 401, valid key → 200 with the correct `request.tenant`. Every failure
+  carries `WWW-Authenticate: Api-Key`, and bad-key and inactive-tenant responses
+  are byte-identical.
+
+Traps hit while building it, worth not re-learning:
+
+- `get_authorization_header()` returns **bytes**. `auth[0] != 'Api-Key'` is
+  always true, and `Tenant.objects.filter(api_key=b'...')` returns empty with
+  **no error** — both fail silently as permanent 401s. Decode before comparing
+  or querying.
+- `filter()` returns a QuerySet and never raises `DoesNotExist`; `get()` returns
+  the row and does. The `except Tenant.DoesNotExist` branch only works with
+  `get()`.
+- Without `authenticate_header()`, DRF rewrites every 401 to **403** — a 401
+  must carry `WWW-Authenticate` to be a valid response, so DRF downgrades rather
+  than emit a malformed one.
+- `is_authenticated` must be a `@property`. As a plain method,
+  `bool(<bound method>)` is `True`, so `IsAuthenticated` passes by accident and
+  any `if not user.is_authenticated` silently misbehaves.
 
 Not started, in order:
 
-1. Install DRF — add to `requirements.txt` and `INSTALLED_APPS`. Nothing else in
-   Phase 2 can start first. A requirements change needs `up -d --build`; the bind
-   mount only shares source, and packages live in the image at `/usr/local`.
-2. Custom DRF authentication class reading the key from a request header and
-   setting `request.tenant`. Never log or echo the key.
-3. Rename `billing/url.py` to `urls.py` before wiring any routes.
-4. Create `billing/services.py` (open decision 2) before writing views.
+1. Create `billing/services.py` (open decision 2) before writing views.
+2. Endpoints: create tenant, create plan, assign plan (Subscription), record
+   usage, generate invoice, plus read endpoints. Create-tenant and create-plan
+   cannot authenticate as a tenant — they need `permission_classes = [AllowAny]`
+   or an admin-only path. Decide that when writing them.
+3. Every queryset in every view filters on `request.tenant`. Auth resolves
+   identity; it does not isolate data. Phase 4's isolation test targets this.
 
 ## How to work with me on this
 
@@ -178,6 +214,32 @@ them unilaterally.
    to `auth.User` (couples billing identity to user accounts and adds a signup
    flow nothing needs yet), and passing the tenant id in the URL path (any caller
    could pass any id, so Phase 4's isolation test would prove nothing).
+
+   **Resolved 2026-07-31, three sub-decisions:**
+
+   - **Header is `Authorization: Api-Key <key>`.** Chosen over `X-API-Key`
+     because ecosystem log scrubbers (Sentry, Datadog, proxy configs) redact
+     `Authorization` by default while a custom header needs configuring. Django's
+     own `DEBUG` error page redacts both — its regex is
+     `API|AUTH|TOKEN|KEY|SECRET|PASS|SIGNATURE|HTTP_COOKIE` — so that was not the
+     tiebreaker. Trade-off accepted: Apache + mod_wsgi strips `Authorization`
+     unless `WSGIPassAuthorization On`; irrelevant on gunicorn, but Phase 6 must
+     not land on mod_wsgi without setting it.
+   - **`authenticate()` returns `(tenant, None)`**, so `request.user` *is* the
+     `Tenant`. Costs a two-line `is_authenticated` property on the model, which
+     is why `IsAuthenticated` works unmodified. `authenticate()` also sets
+     `request.tenant` as a readable alias — views should use that, not
+     `request.user`. Rejected `(AnonymousUser(), tenant)`: it keeps `request.user`
+     honest but forces a custom permission class and makes every call site read
+     `filter(tenant=request.auth)`.
+   - **API keys stay plaintext at rest.** Deliberate, not an oversight — record
+     it in the Phase 6 README. Hashing would be correct for production (a plain
+     fast SHA-256, *not* bcrypt/argon2 — the key is 256 bits of entropy, so slow
+     hashing buys nothing and adds latency to every request). It was deferred
+     because it breaks `default=make_key`: a hashed column cannot hand back the
+     raw key, so generation must move to the service layer with a show-once
+     contract, plus a `key_prefix` column for admin display. Switching later is
+     one migration and one localized change to the creation path.
 2. **Where business logic lives.** Invoice generation is called from two places:
    the Phase 2 API endpoint and the Phase 4 background worker (which has no HTTP
    request). Same for the payment/ledger atomic block. If that logic goes inside
@@ -222,8 +284,6 @@ Schema and code cleanups:
   different tenant — `UsageEvent` reaches tenant only via `subscription.tenant`,
   and `invoice` is an independent FK. Needs a validation check in the invoice
   generator.
-- `billing/url.py` is empty and misnamed; Django and `config/urls.py` expect
-  `urls.py`. Rename while it is still empty.
 - `Subscription.status` has no default, while `Plan.interval` and
   `IdempotencyKey.state` do.
 - No `__str__` on any model yet. Add short ones to make shell debugging
@@ -232,7 +292,6 @@ Schema and code cleanups:
   clickable UI for inspecting tenants, invoices, and ledger rows during Phases
   2–3.
 - Consider migrating existing choice sets to `TextChoices`.
-- DRF is not installed. Phase 2 endpoints and Phase 5 Swagger both need it.
 
 ## Commands
 
@@ -276,9 +335,20 @@ operations (`unique_invoice_period`, `unique_key_per_tenant`) and the
 ## Repository hygiene
 
 `.gitignore` covers `.venv/`, `__pycache__/`, `*.pyc`, `db.sqlite3`, `.env`.
-Tracked file count is 20 as of `ce7e443`, which added Phase 1's infra files
-(`Dockerfile`, `docker-compose.yml`, `.dockerignore`, `requirements.txt`) — if it
-jumps, something got committed that shouldn't have been.
+Tracked file count is 23 as of `94ba8ce` — if it jumps, something got committed
+that shouldn't have been.
+
+`requirements.txt` and `.dockerignore` were **gitignored and untracked** until
+`94ba8ce`, despite an earlier note here claiming `ce7e443` committed them. A
+Dockerized project cannot ignore `requirements.txt` — `COPY requirements.txt`
+is the whole build, so a fresh clone could not build at all. Both are tracked
+now.
+
+Related: `requirements.txt` was once clobbered by a bare `pip freeze` run with
+the venv deactivated, which wrote the host's Ubuntu system packages into it and
+broke the image build on `bcc==0.29.1`. Generate deps with `.venv/bin/pip
+freeze`, never bare `pip freeze`. Because the file was untracked at the time,
+git could not restore it.
 
 `.env` holds real credentials and is gitignored, but `docker-compose.yml`
 references it through `${...}` interpolation, so a fresh clone has no database
