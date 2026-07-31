@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q
 import uuid
 import secrets
 
@@ -44,11 +45,23 @@ class Subscription(models.Model):
     ]
     tenant = models.ForeignKey(Tenant, on_delete=models.PROTECT, related_name='subscriptions')
     plan = models.ForeignKey(Plan, on_delete=models.PROTECT, related_name='subscriptions')
-    status = models.CharField(choices=SUBSCRIPTIONS_CHOICES, max_length=24)
+    status = models.CharField(choices=SUBSCRIPTIONS_CHOICES, max_length=24, default='ACTIVE')
     current_period_start = models.DateTimeField()
     current_period_end = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields = [
+                    'tenant',  
+                ],
+                condition = Q(status = 'ACTIVE'),
+                name = 'unique_active_subscription_per_tenant'
+            )
+        ]
 
 
 class Invoice(models.Model):

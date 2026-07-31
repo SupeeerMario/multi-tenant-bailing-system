@@ -93,9 +93,17 @@ Traps hit while building it, worth not re-learning:
   `bool(<bound method>)` is `True`, so `IsAuthenticated` passes by accident and
   any `if not user.is_authenticated` silently misbehaves.
 
+All of the above is committed as `fcd5daa`. Working tree clean as of 2026-07-31.
+
 Not started, in order:
 
-1. Create `billing/services.py` (open decision 2) before writing views.
+0. **Answer open decision 3 first** — it defines the signature of the invoice
+   generator, which is the main thing `services.py` exists for. Do not start
+   `services.py` before it is settled.
+1. Create `billing/services.py` (open decision 2) before writing views. Hard
+   rule for everything in it: takes a `Tenant` object and plain values, never
+   `request`. The Phase 4 worker calls the same functions with no HTTP request
+   in scope.
 2. Endpoints: create tenant, create plan, assign plan (Subscription), record
    usage, generate invoice, plus read endpoints. Create-tenant and create-plan
    cannot authenticate as a tenant — they need `permission_classes = [AllowAny]`
@@ -121,6 +129,11 @@ This is a learning project. The author is building it themselves on purpose.
 - When the author reports having done something, verify the actual state rather
   than taking it as done. Report what is genuinely correct before what is not —
   a commit that half-worked is not a failure.
+- Do not open a task with a full implementation spec. Tried during the Phase 2
+  auth work and it did not land — the author said so directly. What worked:
+  one step, then a live run in the container printing real values, then the next
+  step. Save the sharp edges (bytes vs text, 401 vs 403) for the moment the
+  author's code actually hits them, not up front.
 
 ## Locked conventions
 
@@ -245,9 +258,63 @@ them unilaterally.
    request). Same for the payment/ledger atomic block. If that logic goes inside
    a view, Phase 4 forces a rewrite. A `billing/services.py` that both views and
    tasks call avoids it. Decide before writing views, not after.
-3. **One invoice per tenant, or per subscription?** `Invoice` links to `Tenant`
-   only, but amount derives from `Plan` via `Subscription`. With one active
-   subscription per tenant this is unambiguous; with several it is not.
+3. ~~**One invoice per tenant, or per subscription?**~~ **DECIDED 2026-07-31:
+   one active subscription per tenant, enforced (option 1).** `Invoice` stays
+   tenant-level, the generator is `generate_invoice(tenant, period_start,
+   period_end)`, and no migration to `Invoice` is needed. Cost is a rule that
+   blocks a second `ACTIVE` subscription for the same tenant. Record it in the
+   Phase 6 decision note as a deliberate simplification.
+
+   Why the other two were rejected: **invoice per subscription** needs a
+   `subscription` FK on `Invoice` plus a widened `unique_invoice_period` before
+   a single endpoint works; **one invoice with `InvoiceLine` rows** is the most
+   correct model for real billing but is past what Phase 2 needs.
+
+   The problem it solves, concretely: with two active subscriptions in one
+   window, a tenant-level generator has two `Plan` rows feeding one `amount`,
+   and `unique_invoice_period` on `(tenant, period_start, period_end)` forbids
+   writing a second row for the same window — so the second invoice is an
+   `IntegrityError`, not a second bill.
+
+   **Enforced and verified 2026-07-31.** `Subscription.Meta.constraints` holds
+   `UniqueConstraint(fields=['tenant'], condition=Q(status='ACTIVE'),
+   name='unique_active_subscription_per_tenant')`, and `Subscription.status`
+   gained `default='ACTIVE'`. Migration
+   `0004_alter_subscription_status_and_more` carries the `AlterField` plus the
+   `AddConstraint`, and is applied. Postgres renders it as a partial index:
+   `CREATE UNIQUE INDEX unique_active_subscription_per_tenant ON
+   public.billing_subscription USING btree (tenant_id) WHERE
+   ((status)::text = 'ACTIVE'::text)`.
+
+   It is a DB constraint, not a Python `if exists` check, for the same reason
+   as idempotency: two concurrent requests can both pass a check before either
+   writes.
+
+   Verified live against Postgres, all in one rolled-back transaction: second
+   ACTIVE row rejected whether the period differs or matches; a different
+   tenant's ACTIVE row unaffected; cancel then re-subscribe works; extra
+   CANCELED and PAST_DUE rows pile up freely because non-matching rows are not
+   in the partial index at all.
+
+   Traps hit getting there:
+
+   - `UniqueConstraint` requires `name=`. Without it: `ValueError: A unique
+     constraint must be named.`
+   - `condition` is a keyword argument **on** `UniqueConstraint`, not a
+     separate constraint. Splitting it into a companion
+     `CheckConstraint(Q(status='ACTIVE'))` makes `CANCELED` and `PAST_DUE`
+     unstorable table-wide, so nothing can ever be canceled, and leaves the
+     `UniqueConstraint` unconditional — one subscription per tenant forever, so
+     re-subscribing after a cancel collides with the dead row.
+   - Django 6.0 removed `CheckConstraint(check=...)`; the argument was renamed
+     to `condition` in 5.1. Django here is 6.0.7.
+   - The condition compares against the **left** value `'ACTIVE'`, what the
+     column stores — not the `'Active'` label.
+
+   Consequence for the endpoints: a second active subscription now surfaces as
+   an `IntegrityError` from the database, not a validation error. The
+   assign-plan path has to catch it and turn it into a 409, and canceling must
+   move the old row off `ACTIVE` before inserting the new one.
 
 ## Known open items
 
@@ -335,7 +402,7 @@ operations (`unique_invoice_period`, `unique_key_per_tenant`) and the
 ## Repository hygiene
 
 `.gitignore` covers `.venv/`, `__pycache__/`, `*.pyc`, `db.sqlite3`, `.env`.
-Tracked file count is 23 as of `94ba8ce` — if it jumps, something got committed
+Tracked file count is 24 as of `fcd5daa` — if it jumps, something got committed
 that shouldn't have been.
 
 `requirements.txt` and `.dockerignore` were **gitignored and untracked** until
