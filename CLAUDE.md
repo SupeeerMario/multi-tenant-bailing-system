@@ -20,7 +20,7 @@ remaining item rather than going along with it.
 | Phase | "Done when" | Status |
 |---|---|---|
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
-| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **In progress** — auth layer done, `generate_invoice` done bar the ledger pair, no endpoints yet |
+| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **In progress** — auth layer and `generate_invoice` (with ledger pair) both done and committed; no endpoints yet |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
@@ -95,24 +95,27 @@ Traps hit while building it, worth not re-learning:
 
 All of the above is committed as `fcd5daa`. Working tree clean as of 2026-07-31.
 
-#### `billing/services.py` — `generate_invoice` (2026-08-04)
+#### `billing/services.py` — `generate_invoice` (2026-08-04, ledger pair 2026-08-05)
 
-Open decision 2 answered by building it. Untracked (`?? billing/services.py`),
-not committed yet. Holds `BillingError` base plus `NoActiveSubscription` and
+Open decision 2 answered by building it. **Complete and committed as `7973e99`.**
+Holds `BillingError` base plus `NoActiveSubscription` and
 `InvoiceAlreadyExists` subclasses, and `generate_invoice(tenant, period_start,
 period_end)` returning the `Invoice`.
 
 What it does, in order: resolve the tenant's one ACTIVE subscription via `get()`
 (raises `NoActiveSubscription`), read `plan` off it, select usage events in the
-window, freeze their ids, sum `quantity`, compute `amount`, then write the
-invoice and stamp the events in a single `transaction.atomic()` block.
+window, freeze their ids, sum `quantity`, compute `amount`, then — in a single
+`transaction.atomic()` block — write the invoice, stamp the events, and write
+the two `LedgerEntry` rows.
 
 Verified live against Postgres — Acme July `Decimal('30.00')` (`20.00 + 0.0025 ×
-4000`), Acme September `Decimal('20.00')` (no usage, base fee only), Globex July
-`Decimal('36.67')` (`36.665` rounded up), Initech `NoActiveSubscription`. Second
-call on an already-invoiced window raises `InvoiceAlreadyExists` and writes
-nothing; `except BillingError` catches it, so the Phase 4 worker's skip-and-
-continue loop will work.
+4000`), Acme August `Decimal('39.44')` (`20.00 + 0.0025 × 7777`), Acme September
+`Decimal('20.00')` (no usage, base fee only), Globex July `Decimal('36.67')`
+(`36.665` rounded up), Initech `NoActiveSubscription`. Second call on an
+already-invoiced window raises `InvoiceAlreadyExists` and writes nothing —
+confirmed by row count, the `IntegrityError` fires on the invoice `create()`
+before either ledger row. `except BillingError` catches both, so the Phase 4
+worker's skip-and-continue loop will work.
 
 Decisions made while building:
 
@@ -131,6 +134,12 @@ Decisions made while building:
   `Invoice.amount`. `unit_fee` is 8 decimal places so the product is too; without
   the quantize, Postgres rounds money into the 2-place column by its own rule.
   Globex's `36.665` is the live case.
+- The ledger pair is `ACCOUNTS_RECEIVABLE +amount` / `REVENUE -amount`, both
+  carrying `tenant`, `invoice`, `currency`, and one shared `transaction_id`
+  generated into a local before the two `create()` calls. Ledger rows go after
+  the invoice `create()` on purpose: a duplicate window trips the
+  `IntegrityError` on the invoice, so no half-pair can exist even before the
+  rollback.
 
 Traps hit, worth not re-learning:
 
@@ -165,13 +174,28 @@ Traps hit, worth not re-learning:
   which reads as a dollar amount in billing logs.
 - Postgres sequences do not roll back on a failed INSERT, so invoice ids skip
   after each rejected duplicate. Cosmetic.
+- **A `default=` callable fires once per row.** `transaction_id` is
+  `UUIDField(default=uuid.uuid4, ...)`, so two `create()` calls produced two
+  different uuids and the "pair" was two unrelated one-sided rows. Caught live:
+  `distinct transaction_ids: 2`. `sum == 0` still passed, because summing the
+  whole table hides it — the pair link is what breaks. Same mechanism as
+  `default=make_key` on `Tenant.api_key`, where per-row evaluation is the
+  desired behavior.
+- **Bare `uuid.uuid4` is the function, not a uuid.** Passing it as a *value*
+  gives `ValidationError: ['"<function uuid4 at 0x...>" is not a valid UUID.']`.
+  Bare is correct for `default=` (Django calls it); a value needs the `()`.
+  And calling `uuid.uuid4()` inline in both `create()` calls is back to two
+  distinct uuids — it has to go into a local first.
 
-Still missing before `generate_invoice` is finished: **the ledger pair.** The
-invoice is written but `LedgerEntry` is still empty, so an `OPEN` invoice claims
-money owed while the ledger says zero — and Phase 5's "ledger sums to zero" test
-would pass on an empty table. Two rows inside the same `atomic()` block, sharing
-**one** `transaction_id`, carrying `tenant`, `invoice`, `currency`, description:
-`ACCOUNTS_RECEIVABLE` `+amount` and `REVENUE` `-amount`.
+**Ledger pair verified live 2026-08-05.** Per invoice: exactly 2 rows, 1
+distinct `transaction_id`, pair summing to `0.00`. Per tenant: total ledger sum
+`0`, and `sum(ACCOUNTS_RECEIVABLE)` equals the sum of that tenant's `OPEN`
+invoices (`89.44` Acme, `36.67` Globex). No ledger row whose `tenant` disagrees
+with its invoice's tenant.
+
+Still open on the ledger rows: `description` is never set, so both rows land
+with `''`. Not an error (`blank=True`), but Phase 3 wants something readable
+like `f"Invoice {invoice.id} {period_start.date()}–{period_end.date()}"`.
 
 #### Seed data currently in the dev database
 
@@ -181,21 +205,36 @@ subscription, exists to test `NoActiveSubscription`). Plan `2 Standard`,
 `base_fee 20.00`, `unit_fee 0.00250000`. Subscriptions `8` (Acme, ACTIVE), `9`
 (Globex, ACTIVE). Six `UsageEvent` rows: Acme `1000/2500/500` inside July,
 `9999` in June, `7777` exactly on `2026-08-01 00:00`; Globex `6666` on
-`2026-07-10`. Four invoices exist. Acme api_key
+`2026-07-10`. Acme api_key
 `VJqUYEgkyQUS6iSN4rcpYzjcHzPDos8PbSHaLIj7zAI`.
 
-Events 1, 2, 3, 5 have `invoice_id` NULL despite being billed — their invoices
-were generated before the stamping line existed. Stale, not a live bug.
+**Re-seeded 2026-08-05.** The original four invoices predated both the
+event-stamping line and the ledger pair, so they had zero `LedgerEntry` rows and
+left events 1/2/3/5 unstamped — a tenant owing `89.44` read as AR `0.00`. Fixed
+by deleting all four and regenerating through `generate_invoice`, which is the
+only path that writes a correct ledger. Deleting was safe because
+`UsageEvent.invoice` is `SET_NULL` (releases events rather than blocking) and no
+ledger rows existed to trip `PROTECT`. The regenerated amounts came back
+identical to the deleted ones, which is itself a check on the generator.
+
+Current invoices are `17` (Acme July `30.00`), `18` (Acme August `39.44`), `19`
+(Acme September `20.00`), `20` (Globex July `36.67`) — ids jumped because
+Postgres sequences do not roll back. Eight ledger rows total. Events 1/2/3 → 17,
+5 → 18, 6 → 20; event 4 (`9999`, June) is correctly NULL, genuinely unbilled.
+
+Do not hand-backfill ledger rows if this drifts again — regenerate through the
+service. The ledger is append-only and meant to be produced by the code path.
 
 Not started, in order:
 
-1. Finish `generate_invoice` with the ledger pair, then commit `services.py`.
-2. Endpoints: create tenant, create plan, assign plan (Subscription), record
+1. Endpoints: create tenant, create plan, assign plan (Subscription), record
    usage, generate invoice, plus read endpoints. Create-tenant and create-plan
    cannot authenticate as a tenant — they need `permission_classes = [AllowAny]`
    or an admin-only path. Decide that when writing them.
-3. Every queryset in every view filters on `request.tenant`. Auth resolves
+2. Every queryset in every view filters on `request.tenant`. Auth resolves
    identity; it does not isolate data. Phase 4's isolation test targets this.
+3. The assign-plan endpoint must catch the `IntegrityError` from
+   `unique_active_subscription_per_tenant` and return 409, not 500.
 
 ## How to work with me on this
 
@@ -347,7 +386,8 @@ them unilaterally.
    Failures are custom exceptions (`BillingError` and subclasses) that the view
    maps to status codes and the worker catches to skip a tenant; no HTTP
    concepts, including `Http404`, cross into the service layer. See the Phase 2
-   section above for what `generate_invoice` does and what is still missing.
+   section above for what `generate_invoice` does. Built and committed as
+   `7973e99`.
 3. ~~**One invoice per tenant, or per subscription?**~~ **DECIDED 2026-07-31:
    one active subscription per tenant, enforced (option 1).** `Invoice` stays
    tenant-level, the generator is `generate_invoice(tenant, period_start,
@@ -405,6 +445,22 @@ them unilaterally.
    an `IntegrityError` from the database, not a validation error. The
    assign-plan path has to catch it and turn it into a 409, and canceling must
    move the old row off `ACTIVE` before inserting the new one.
+4. ~~**How create-tenant and create-plan authenticate.**~~ **DECIDED 2026-08-05:
+   `permission_classes = [AllowAny]` on both.** Neither can authenticate as a
+   tenant — create-tenant has no tenant yet and no key to present, and a plan
+   belongs to no tenant. Phase 2's "Done when" requires the whole flow via API,
+   so moving them to Django admin or a management command was not an option.
+
+   Consequence: both endpoints are open. Record it in the Phase 6 decision note
+   next to the plaintext-keys entry as a deliberate demo simplification.
+   Create-tenant returns the generated `api_key` in its response — that is the
+   only way a caller obtains credentials for every later request.
+
+   Rejected for now: an `ADMIN_API_KEY` env var plus a permission class checking
+   it. Correct, but a second auth scheme to build and test before a single
+   endpoint works. Clean Phase 6 upgrade once the flow runs end to end. Nothing
+   about this choice affects Phase 4's isolation test, which targets the
+   tenant-scoped endpoints (usage, invoices, ledger).
 
 ## Known open items
 
@@ -493,7 +549,7 @@ operations (`unique_invoice_period`, `unique_key_per_tenant`) and the
 ## Repository hygiene
 
 `.gitignore` covers `.venv/`, `__pycache__/`, `*.pyc`, `db.sqlite3`, `.env`.
-Tracked file count is 24 as of `fcd5daa` — if it jumps, something got committed
+Tracked file count is 26 as of `7973e99` — if it jumps, something got committed
 that shouldn't have been.
 
 `requirements.txt` and `.dockerignore` were **gitignored and untracked** until
