@@ -21,6 +21,9 @@ class Tenant(models.Model):
     def is_authenticated(self):
         return True
 
+    def __str__(self):
+        return f"Tenant with name {self.name} is currently active : {self.is_active}"
+
 class Plan(models.Model):
 
     PLAN_CHOICES = [
@@ -35,6 +38,8 @@ class Plan(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def __str__(self):
+        return f"{self.name} plan costs {self.base_fee} as a base fee and {self.unit_fee} as a unit fee with {self.currency} currency "
 
 class Subscription(models.Model):
 
@@ -62,6 +67,9 @@ class Subscription(models.Model):
                 name = 'unique_active_subscription_per_tenant'
             )
         ]
+
+    def __str__(self):
+        return f"{self.tenant} is subscribed to {self.plan} with the status of {self.status}, from {self.current_period_start} to {self.current_period_end}"
 
 
 class Invoice(models.Model):
