@@ -6,6 +6,7 @@ class TenantSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Tenant
         fields = [
+            'id',
             'name',
             'api_key',
             'is_active'
@@ -22,6 +23,7 @@ class PlanSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Plan
         fields = [
+            'id',
             'name',
             'base_fee',
             'unit_fee',
@@ -52,6 +54,7 @@ class SubscriptionsSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Subscription
         fields = [
+            'id',
             'tenant',
             'plan',
             'status',
@@ -62,4 +65,22 @@ class SubscriptionsSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'tenant':{'read_only': True},
             'status':{'read_only': True},
+        }
+
+
+class UsageEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.UsageEvent
+        fields = [
+            'id',
+            'subscription',
+            'metric',
+            'quantity',
+            'invoice',
+            'occurred_at'
+        ]
+
+        extra_kwargs = {
+            'subscription':{'read_only':True},
+            'invoice':{'read_only': True},
         }

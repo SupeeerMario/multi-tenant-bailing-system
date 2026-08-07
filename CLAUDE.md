@@ -20,7 +20,7 @@ remaining item rather than going along with it.
 | Phase | "Done when" | Status |
 |---|---|---|
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
-| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **In progress** — auth layer and `generate_invoice` (with ledger pair) both done and committed; no endpoints yet |
+| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **In progress** — auth layer, `generate_invoice`, and four endpoints (tenant, plan, subscription, usage read+write) done. `id` now in every serializer. Missing: the generate-invoice endpoint, plus invoice/ledger read endpoints |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
@@ -44,7 +44,7 @@ The **infrastructure half**, confirmed by running the stack:
   Postgres. Named volume `multi-tenant-bailing-system_db` persists them.
 - Postgres logs are clean — 0 `FATAL` lines.
 
-### Phase 2 — where it stands (2026-07-31)
+### Phase 2 — where it stands (last verified 2026-08-07)
 
 Done:
 
@@ -225,16 +225,281 @@ Postgres sequences do not roll back. Eight ledger rows total. Events 1/2/3 → 1
 Do not hand-backfill ledger rows if this drifts again — regenerate through the
 service. The ledger is append-only and meant to be produced by the code path.
 
-Not started, in order:
+**Endpoint testing garbage cleaned out 2026-08-07.** Probing the three new
+endpoints created tenants `21/22/23` and eight throwaway plans; all deleted, in
+dependency order (subscriptions, then tenants, then plans — `PROTECT` blocks the
+reverse). Invoices, ledger rows, and usage events were never touched and still
+read `4 / 8 / 6`.
 
-1. Endpoints: create tenant, create plan, assign plan (Subscription), record
-   usage, generate invoice, plus read endpoints. Create-tenant and create-plan
-   cannot authenticate as a tenant — they need `permission_classes = [AllowAny]`
-   or an admin-only path. Decide that when writing them.
-2. Every queryset in every view filters on `request.tenant`. Auth resolves
-   identity; it does not isolate data. Phase 4's isolation test targets this.
-3. The assign-plan endpoint must catch the `IntegrityError` from
-   `unique_active_subscription_per_tenant` and return 409, not 500.
+Two pieces of drift this exposed, both still present:
+
+- **Initech (`15`) now has an ACTIVE subscription, `11`.** The line above says it
+  exists to test `NoActiveSubscription`. It no longer does — `generate_invoice`
+  will happily bill it. Cancel subscription `11` to restore the fixture's purpose.
+- Tenant `20 test name` exists with subscriptions `20` (CANCELED) and `22`
+  (ACTIVE), left from the constraint work. Harmless, but it is not in any seed
+  description.
+
+This is the second time ad-hoc rows have drifted from what this file claims. A
+real fixture or factory is Phase 5 work, but the cost is being paid now.
+
+**Cleaned again after the usage-endpoint work (2026-08-07).** Usage events
+`21`–`27` and tenant `26 NoSubCo` deleted; all seven events were unbilled
+(`invoice_id` NULL) so nothing was released from an invoice. Baseline confirmed
+back to **6 usage events, 4 tenants, 4 invoices, 8 ledger rows, 1 plan**. Use
+those five numbers as the check that the dev database is clean.
+
+#### First three endpoints (2026-08-06, `c3086cb` + `13f695e`)
+
+`serializers.py`, `views.py`, `urls.py`, `admin.py` all have content now. Routes
+sit under the `billing/` prefix from `config/urls.py`:
+
+| Route | View | Permission | Serializer |
+|---|---|---|---|
+| `POST billing/tenants/` | `TenantCreateView` (`CreateAPIView`) | `AllowAny` | `TenantSerializer` |
+| `POST billing/plans/` | `PlanCreateView` (`CreateAPIView`) | `AllowAny` | `PlanSerializer` |
+| `POST billing/subscriptions/` | `SubscriptionsCreateView` (`CreateAPIView`) | `IsAuthenticated` | `SubscriptionsSerializer` |
+| `GET/POST billing/usage/` | `UsageEventListCreateView` (`ListCreateAPIView`) | `IsAuthenticated` | `UsageEventSerializer` |
+
+Decisions visible in the code:
+
+- `TenantSerializer` exposes `name`, `api_key`, `is_active`; the last two are
+  `read_only`. Read-only still **renders in the response**, so create-tenant
+  hands back the generated `api_key` exactly as open decision 4 requires — the
+  flag only blocks it as input.
+- `SubscriptionsSerializer` marks `tenant` and `status` read-only. `tenant` comes
+  from `request.tenant` in `perform_create`, never from the body; `status` falls
+  back to the model `default='ACTIVE'`.
+- `SubscriptionAlreadyExists(APIException)` lives in `views.py` with
+  `status_code = 409`. `perform_create` wraps `serializer.save(tenant=tenant)` in
+  `try/except IntegrityError` and raises it, which answers the old Phase 2 item 3.
+- `admin.py` registers all seven models. `__str__` added to `Tenant`, `Plan`,
+  `Subscription` in `13f695e`.
+
+**Verified live 2026-08-07** against the running stack, real curls:
+
+| Case | Result |
+|---|---|
+| `POST tenants/` no auth | 201, `api_key` in body |
+| `POST plans/` no auth | 201 |
+| `POST subscriptions/` valid key | 201, `tenant` = the key's tenant |
+| second ACTIVE sub, same tenant | 409 `"Conflict. This tenant already has an active subscription"` |
+| no `Authorization` header | 401 |
+| missing body fields | 400, field-keyed |
+| `{"plan": 9999}` | 400 `Invalid pk "9999" - object does not exist.` |
+
+Isolation proved on the write path: a request carrying tenant A's key with
+`"tenant": 15` in the body created the row under **A**, not 15. `read_only` on
+`tenant` plus `perform_create` overriding it is what makes body-spoofing a no-op.
+
+Why the bare `except IntegrityError` is safe today: `ATOMIC_REQUESTS` is not set,
+so the request runs in autocommit and the failed INSERT is its own transaction.
+Enabling `ATOMIC_REQUESTS` later would break it — the surrounding transaction
+would already be poisoned when the `except` runs. Also note DRF's
+`PrimaryKeyRelatedField` validates the `plan` FK during `is_valid()`, so a bad
+plan returns 400 and never reaches `save()`;
+`unique_active_subscription_per_tenant` really is the only integrity error that
+can currently reach that handler. It becomes a liability the moment a second
+constraint lands on `Subscription`.
+
+#### Negative money closed (2026-08-07, `04bfbfd` + `73af90a`)
+
+Found by probing the live plan endpoint: `POST billing/plans/` with
+`base_fee: "-99.00"` returned **201**. Nothing validated fee sign. A plan at
+`base_fee -99.00, unit_fee 0.001` with 1000 units yields `amount = -98.00`, and
+`generate_invoice` writes `ACCOUNTS_RECEIVABLE -98.00` / `REVENUE +98.00`. Both
+ledger invariants in this file still **pass** — the pair sums to zero and the
+tenant total sums to zero. Only "outstanding balance = sum where
+`ACCOUNTS_RECEIVABLE`" exposes it, reading `-98.00`: you owe the customer. A
+sum-to-zero test goes green on corrupt data.
+
+Fixed in three layers, each doing a different job:
+
+| Layer | Covers | Produces |
+|---|---|---|
+| `PlanSerializer.validate_base_fee` / `validate_unit_fee` | HTTP only | 400, field-keyed message |
+| `Plan.clean()` | admin, explicit `full_clean()` | `ValidationError` |
+| `CheckConstraint` `base_fee__gte=0`, `unit_fee__gte=0` | everything, including shell and the Phase 4 worker | `IntegrityError` |
+
+The serializer is for the message; **the constraint is the guarantee**. Migration
+`0006_remove_plan_prevent_negative_base_fee_and_more` carries the final `>= 0`
+pair. Verified live: negatives 400 over HTTP and `IntegrityError` from a raw
+`Plan.objects.create()`, valid plans 201.
+
+`>= 0`, not `> 0` — free (`base_fee 0`) and flat-rate (`unit_fee 0`) plans are
+both legitimate products. Billed end to end to confirm: free plan with 1000 units
+at `unit_fee 0.005` → `amount 5.00`, ledger `[5.00, -5.00]`, sum `0.00`. Zero
+usage on a free plan → `amount 0.00` and a `0.00`/`0.00` ledger pair, which
+balances but records no movement of money. Decide later whether a zero invoice
+should write a pair at all; not a Phase 2 problem.
+
+Traps hit, worth not re-learning:
+
+- **Django 6.0 has no `CheckConstraint(check=...)`** — renamed to `condition=` in
+  5.1. `TypeError: CheckConstraint.__init__() got an unexpected keyword argument
+  'check'`. This is an **import-time** error, so nothing runs: not
+  `makemigrations`, not `check`, not the server. Second time this rename has bitten
+  (see decision 3).
+- **A failed migration kills the web container**, `Exited (1)`, because the
+  Dockerfile `CMD` is `migrate && runserver`. A bad migration means no server at
+  all, not just an unapplied change. That is the PID-1/entrypoint item under Known
+  open items showing its teeth.
+- **`AddConstraint` validates existing rows.** A leftover `base_fee -99.00` row
+  gave `check constraint "prevent_negative_base_fee" of relation "billing_plan" is
+  violated by some row`. Clean the data before adding the constraint.
+- **Editing a constraint's `condition` changes no DDL until `makemigrations`.**
+  Model said `>= 0` while Postgres still enforced `> 0`. Django cannot ALTER a
+  check constraint, so the generated migration is drop-then-recreate — four
+  operations for two constraints.
+- **DRF never calls `full_clean()`.** `ModelSerializer.save()` goes straight to
+  `objects.create()`, so `Model.clean()` is dead code on the API path — it only
+  fires from admin. `serializer.is_valid()` returned `True` on `base_fee -99.00`
+  and the request 500'd on the DB constraint. Model `validators=` would be picked
+  up (ModelSerializer copies them onto the generated field); `clean()` is not.
+- **A `validate_<field>` method must `return value`.** It is a transformer, not a
+  predicate. Falling off the end returns `None`, DRF stores that in
+  `validated_data`, and *every valid request* 500s on
+  `null value in column "base_fee" ... violates not-null constraint`. The invalid
+  cases keep working because they `raise` before returning — so the bug hides
+  behind passing negative tests.
+- **`CHECK` constraints are blind to NULL.** `NULL >= 0` is UNKNOWN, and a CHECK
+  only fails on explicit false, so `CHECK (base_fee >= 0)` let the NULL through.
+  `NOT NULL` caught it. Every check constraint needs NULL considered separately.
+- **Field-level validators must raise a bare message, not a dict.** DRF already
+  keys the error by field name from the method name, so
+  `ValidationError({'base_fee': '...'})` double-nests into
+  `{"base_fee":{"base_fee":"..."}}`. The dict form belongs in `Model.clean()` and
+  in serializer-level `validate()`, which have no field context.
+- **`{'key': 'value'}` without the braces is a `SyntaxError`.** Removing the dict
+  wrapper but keeping the colon gives
+  `ValidationError('base_fee' : 'message')` — `key: value` is legal only inside
+  `{}`. Another import-time failure that takes the container down.
+- **`Decimal('0')` is falsy.** `if self.base_fee and self.unit_fee:` in
+  `Plan.clean()` skips zero entirely — the exact value the rule now cares about.
+  Guard on `is not None`, never truthiness, for numeric fields.
+- **DRF collects all field validators; `Model.clean()` stops at the first raise.**
+  Sending both fees negative returns both errors from the serializer, but
+  `clean()` would report only one.
+
+#### Usage endpoint, read and write (2026-08-07)
+
+`GET/POST billing/usage/` → `UsageEventListCreateView`. `id` also added to all
+four serializers' `fields`, which unblocks the API-only flow (a caller can now
+learn a plan's id from the create response instead of reading it out of psql).
+
+The write path, and why it looks different from the subscription one:
+`UsageEvent` has **no `tenant` column** — it reaches a tenant only through
+`subscription.tenant`. So the `read_only` + `save(tenant=...)` trick does not
+transfer; there is no field to override. Instead `perform_create` resolves the
+tenant's one ACTIVE subscription itself and passes it as the save kwarg:
+
+```python
+sub = models.Subscription.objects.get(tenant=tenant, status='ACTIVE')
+serializer.save(subscription=sub)
+```
+
+`subscription` and `invoice` are both `read_only`, so neither can be client
+supplied. `invoice` is not "read-only input" so much as *not part of creating a
+usage event at all* — it starts NULL and `generate_invoice` stamps it later via
+`frozen.update(invoice=invoice)`. Event 4 (`9999`, June) is permanently NULL and
+that is correct data, not missing data.
+
+The read path uses `get_queryset`, not a `queryset` class attribute:
+
+```python
+return models.UsageEvent.objects.filter(subscription__tenant=self.request.tenant)
+```
+
+`subscription__tenant` spans the FK in one join because there is no direct
+column. The class attribute was deliberately **removed** — `objects.all()` is
+harmless on a POST-only view but serves every tenant's rows the moment GET works.
+`get_queryset` is the hook with `self.request` in scope.
+
+**Verified live 2026-08-07**, both verbs:
+
+| Case | Result |
+|---|---|
+| `POST` valid | 201, `subscription 8`, `invoice null` |
+| `POST {"subscription": 9}` (another tenant's) | 201, landed on **8** — spoof ignored |
+| `POST {"invoice": 20}` | 201, `invoice` stayed `null` |
+| `POST` missing fields | 400 on `metric` / `quantity` / `occurred_at` |
+| `POST {"quantity": -5}` | 400 `Ensure this value is greater than or equal to 0.` |
+| `POST`, tenant with no ACTIVE sub | 409 `No active subscription found for the current tenant` |
+| `GET` as Acme | 200, 12 rows, all `subscription 8` |
+| `GET` as Globex | 200, 1 row (event 6) |
+| `GET` as a tenant with no subscription | 200 `[]` |
+| `GET`/`POST` no auth | 401 |
+
+Row counts matched the DB exactly (13 → 12 events, 14 → 1). **This is the first
+proof of the read half of tenant isolation** — every earlier check only proved a
+tenant could not *affect* another's data. Phase 4's test targets this view.
+
+`quantity: -5` returning 400 is free: `PositiveIntegerField` carries a
+`MinValueValidator(0)` and `ModelSerializer` copies model-field validators onto
+the serializer field. Same mechanism noted under the fee work — `validators=`
+transfers to DRF, `clean()` does not.
+
+Note the deliberate asymmetry: a tenant with no active subscription gets **200
+`[]` on GET** but **409 on POST**, same URL. An empty collection is a successful
+read; recording usage with nothing to attach it to genuinely cannot proceed.
+
+Traps hit, worth not re-learning:
+
+- **`Meta.model`, not `Meta.models`.** The typo just sets an unused attribute, so
+  import succeeds and it fails lazily on first use with `AssertionError: Class
+  UsageEventSerializer missing "Meta.model" attribute`. Easy to conflate because
+  `from . import models` puts the plural in scope in the same file.
+- **`status.HTTP_404_NOT_FOUND` is the integer `404`**, not an exception.
+  `raise` on it gives `TypeError: exceptions must derive from BaseException`.
+  That module is a bag of named numbers; raising needs an `APIException` subclass.
+- **`serializers.save(...)` vs `serializer.save(...)`.** The module is imported as
+  `serializers` in `views.py`, which shadows the parameter name by one letter.
+  `hasattr(serializers, 'save')` is `False`, so it is an `AttributeError` 500.
+- **`get_queryset()`, not `list()`.** `list()` builds the HTTP response
+  (paginate → serialize → `Response`); returning a raw QuerySet from it breaks
+  rendering. `get_queryset()` answers "which rows" and lets DRF do the rest.
+- **A comment is not a statement.** `if not tenant:` followed only by `# ...` is
+  `IndentationError: expected an indented block`. Import-time, so nothing runs.
+- **That `if not tenant` was dead anyway.** `IsAuthenticated` runs before the
+  handler, so an absent tenant is a 401 and the method is never entered. Fifth
+  time this shape has appeared in the project (see the `services.py` notes on
+  `filter()` never being `None` and `get()` never returning falsy). When writing
+  the next `if not ...`, ask what would have to fail upstream for it to fire.
+- **The `runserver` reloader can miss bind-mount edits.** A `NameError` for a
+  renamed class survived two runs while `docker compose exec web grep` showed the
+  container reading the **new** file — the process was serving stale bytecode.
+  Sibling of the stale-`COPY` trap below, different mechanism: if a result
+  contradicts source you just read, confirm the process reloaded, not just the
+  file. `docker compose restart web`.
+
+Still not started, in order:
+
+1. **Generate-invoice endpoint** — the last one before Phase 2's "Done when" is
+   met. Thin wrapper over `generate_invoice`; the work is mapping
+   `NoActiveSubscription` and `InvoiceAlreadyExists` to status codes, since the
+   service layer deliberately knows no HTTP. Open question to settle first: where
+   `period_start` / `period_end` come from. Request body is simplest, but see the
+   `unique_invoice_period` timestamp item under Known open items — exact-timestamp
+   comparison means `T00:00:00Z` and `T00:00:00.001Z` are two different periods
+   and both would generate a July invoice.
+2. Remaining read endpoints: invoices, ledger. Both need the same `get_queryset`
+   treatment; `Invoice` and `LedgerEntry` do have direct `tenant` FKs, so those
+   filter without a join.
+3. Nothing checks `plan.is_active` before subscribing. Not reachable over HTTP yet
+   (`is_active` is read-only in `PlanSerializer`), but admin can deactivate a plan
+   and the subscribe call still returns 201. A
+   `PrimaryKeyRelatedField(queryset=Plan.objects.filter(is_active=True))` turns it
+   into a 400.
+4. Dead local `data = self.request.data` in `SubscriptionsCreateView.perform_create`.
+5. **No pagination on any list view.** `GET billing/usage/` returned all 12 rows
+   in one response. Usage events are the highest-volume table in the schema by a
+   wide margin. `DEFAULT_PAGINATION_CLASS` + `PAGE_SIZE` in `REST_FRAMEWORK`
+   applies to every list view at once — cheap now, Phase 5 otherwise.
+6. **No `Meta.ordering` on `UsageEvent`.** The list came back `[4, 1, 2, 3, 5, …]`
+   — Postgres returns rows in whatever order it likes without `ORDER BY`, and that
+   order shifts as rows are updated. This becomes a correctness bug the moment
+   pagination lands: unordered pagination silently drops and duplicates rows
+   across pages, and Django warns about it.
 
 ## How to work with me on this
 
@@ -461,6 +726,15 @@ them unilaterally.
    endpoint works. Clean Phase 6 upgrade once the flow runs end to end. Nothing
    about this choice affects Phase 4's isolation test, which targets the
    tenant-scoped endpoints (usage, invoices, ledger).
+5. ~~**Are zero-fee plans a legal product?**~~ **DECIDED 2026-08-07: yes, both
+   shapes.** `base_fee 0` (usage-only) and `unit_fee 0` (flat-rate) are real
+   billing products, so the constraints are `__gte=0`, not `__gt=0`. First cut
+   used `__gt=0` and had to be migrated back — `0006` is that reversal.
+
+   Consequence worth watching: a free plan with zero usage generates an invoice
+   for `0.00` and a `0.00`/`0.00` ledger pair. It balances and breaks no
+   invariant, but it records a movement of no money. Whether a zero invoice
+   should write a ledger pair at all is a Phase 3 question, not a Phase 2 one.
 
 ## Known open items
 
@@ -499,13 +773,30 @@ Schema and code cleanups:
   generator.
 - ~~`Subscription.status` has no default~~ — fixed in `6c95a9f`,
   `default='ACTIVE'`.
-- No `__str__` on any model yet. Add short ones to make shell debugging
-  readable. Live output is still `<Subscription: Subscription object (8)>`,
-  which made every shell check during the `services.py` work harder to read.
-- `billing/admin.py` registers nothing. Registering the seven models gives a
-  clickable UI for inspecting tenants, invoices, and ledger rows during Phases
-  2–3.
+- ~~No `__str__` on any model~~ — partly fixed in `13f695e`. `Tenant`, `Plan`,
+  `Subscription` have one. `Invoice`, `UsageEvent`, `LedgerEntry`, and
+  `IdempotencyKey` still print as `<Invoice: Invoice object (17)>`, and those are
+  the four that matter most for reading ledger checks in the shell.
+- ~~`billing/admin.py` registers nothing~~ — fixed in `c3086cb`, all seven
+  registered.
+- `Plan.clean()` guards with `if self.base_fee and self.unit_fee:`. `Decimal('0')`
+  is falsy, so a free or flat-rate plan skips the whole block. Harmless right now
+  (nothing in the block would reject zero) but it silently disables any check
+  added there later. Guard on `is not None`.
 - Consider migrating existing choice sets to `TextChoices`.
+
+Validation layering (settled during the negative-money work, applies to every
+model from here on):
+
+- A DB `CheckConstraint` is the only layer that cannot be bypassed. Anything the
+  Phase 4 worker, a shell, or admin can write has to be guarded there.
+- DRF never calls `full_clean()`, so `Model.clean()` does **not** run on the API
+  path. Model-field `validators=` do reach DRF (ModelSerializer copies them onto
+  the generated field); `clean()` does not.
+- Put the human-readable message in the serializer, put the guarantee in the
+  constraint, and expect to write the rule twice. That duplication is deliberate.
+- `CHECK` constraints ignore NULL — `NULL >= 0` is UNKNOWN, not false. Pair every
+  check with `NOT NULL` if NULL is not a legal value.
 
 ## Commands
 
@@ -549,7 +840,8 @@ operations (`unique_invoice_period`, `unique_key_per_tenant`) and the
 ## Repository hygiene
 
 `.gitignore` covers `.venv/`, `__pycache__/`, `*.pyc`, `db.sqlite3`, `.env`.
-Tracked file count is 26 as of `7973e99` — if it jumps, something got committed
+Tracked file count is 29 as of `73af90a` (was 26 at `7973e99`; `serializers.py`
+and migrations `0005`/`0006` account for the three) — if it jumps, something got committed
 that shouldn't have been.
 
 `requirements.txt` and `.dockerignore` were **gitignored and untracked** until

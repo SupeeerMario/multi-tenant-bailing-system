@@ -10,6 +10,11 @@ class SubscriptionAlreadyExists(APIException):
     default_code = "subscription_exists"
 
 
+class NoActiveSubscription(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = 'No active subscription found for the current tenant'
+    default_code = 'subscription_not_found'
+
 
 
 
@@ -40,3 +45,22 @@ class SubscriptionsCreateView(generics.CreateAPIView):
 
         except IntegrityError:
             raise SubscriptionAlreadyExists()
+
+
+class UsageEventListCreateView(generics.ListCreateAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = serializers.UsageEventSerializer
+
+    def perform_create(self, serializer):
+        tenant = self.request.tenant
+
+        try:
+            sub = models.Subscription.objects.get(tenant = tenant, status = 'ACTIVE')
+        except models.Subscription.DoesNotExist:
+            raise NoActiveSubscription()
+
+        serializer.save(subscription = sub)
+
+    def get_queryset(self):
+        return models.UsageEvent.objects.filter(subscription__tenant = self.request.tenant).order_by('id')
+        
