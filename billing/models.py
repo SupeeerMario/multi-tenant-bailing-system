@@ -2,6 +2,7 @@ from django.db import models
 from django.db.models import Q
 import uuid
 import secrets
+from django.core.exceptions import ValidationError
 
 # Create your models here.
 
@@ -37,6 +38,32 @@ class Plan(models.Model):
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition = Q(base_fee__gte = 0),
+                name = 'prevent_negative_base_fee'
+            ),
+            models.CheckConstraint(
+                condition = Q(unit_fee__gte = 0),
+                name = 'prevent_negative_unit_fee'
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+
+        if self.base_fee and self.unit_fee:
+            if self.unit_fee < 0:
+                raise ValidationError({
+                    'unit_fee' : 'unit fee cannot be a negative number'
+                })
+            if self.base_fee < 0:
+                raise ValidationError({
+                    'base_fee' : 'base fee cannot be a negative number'
+                })
+
 
     def __str__(self):
         return f"{self.name} plan costs {self.base_fee} as a base fee and {self.unit_fee} as a unit fee with {self.currency} currency "
