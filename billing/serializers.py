@@ -35,6 +35,19 @@ class PlanSerializer(serializers.ModelSerializer):
         }
 
 
+    def validate_base_fee(self, value):
+        if value < 0:
+            raise serializers.ValidationError('base fee cannot be a negative number')
+        
+        return value
+
+    def validate_unit_fee(self, value):
+        if value < 0:
+            raise serializers.ValidationError('unit fee cannot be a negative number')
+        
+        return value
+
+
 class SubscriptionsSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Subscription
