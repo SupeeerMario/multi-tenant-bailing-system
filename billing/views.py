@@ -98,7 +98,7 @@ class InvoiceAPIView(APIView):
             raise PeriodNotEnded(f"Cannot make a bill for {sub.current_period_end} as the period has not ended")
 
         try:
-            invoice = services.generate_invoice(request.tenant, sub.current_period_start, sub.current_period_end)
+            invoice = services.generate_invoice(request.tenant)
         except services.InvoiceAlreadyExists as e:
             raise InvoiceAlreadyExists(e)
         except services.NoActiveSubscription as e:

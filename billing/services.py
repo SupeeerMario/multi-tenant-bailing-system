@@ -4,6 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from django.db import IntegrityError, transaction
 import uuid
 from dateutil.relativedelta import relativedelta
+from django.utils import timezone
 
 class BillingError(Exception):
     pass
@@ -14,16 +15,25 @@ class NoActiveSubscription(BillingError):
 class InvoiceAlreadyExists(BillingError):
     pass
 
+class PeriodNotEnded(BillingError):
+    pass
 
-def generate_invoice(tenant, period_start, period_end):
-
+def generate_invoice(tenant):
+    
     try:
         
         active_subscription =  Subscription.objects.get(tenant = tenant, status = 'ACTIVE')
     except Subscription.DoesNotExist:
 
         raise NoActiveSubscription(f"tenant {tenant.id} has no active subscription")
-    
+
+    period_start = active_subscription.current_period_start
+    period_end = active_subscription.current_period_end
+
+    if period_end > timezone.now():
+        raise PeriodNotEnded(f'Cannot make a bill for {period_end} as the period has not ended')
+
+
     plan = active_subscription.plan
 
     qs = UsageEvent.objects.filter(subscription = active_subscription, occurred_at__gte = period_start, occurred_at__lt = period_end)
