@@ -82,7 +82,7 @@ class UsageEventListCreateView(generics.ListCreateAPIView):
         serializer.save(subscription = sub)
 
     def get_queryset(self):
-        return models.UsageEvent.objects.filter(subscription__tenant = self.request.tenant).order_by('id')
+        return models.UsageEvent.objects.filter(subscription__tenant = self.request.tenant).order_by('occurred_at', 'id')
         
 
 

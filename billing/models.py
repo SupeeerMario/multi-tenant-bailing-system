@@ -23,7 +23,7 @@ class Tenant(models.Model):
         return True
 
     def __str__(self):
-        return f"Tenant with name {self.name} is currently active : {self.is_active}"
+        return f"{self.name} tenant with the id of {self.id}, is currently active : {self.is_active}"
 
 class Plan(models.Model):
 
@@ -66,7 +66,7 @@ class Plan(models.Model):
 
 
     def __str__(self):
-        return f"{self.name} plan costs {self.base_fee} as a base fee and {self.unit_fee} as a unit fee with {self.currency} currency "
+        return f"plan with the id of {self.id}, is named {self.name} and costs {self.base_fee} as a base fee and {self.unit_fee} as a unit fee with {self.currency} currency "
 
 class Subscription(models.Model):
 
@@ -100,7 +100,7 @@ class Subscription(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.tenant} is subscribed to {self.plan} with the status of {self.status}, from {self.current_period_start} to {self.current_period_end}"
+        return f"subscription with the id of {self.id} is for tenant {self.tenant_id} whose subscribed to plan {self.plan_id} with the status of {self.status}, from {self.current_period_start} to {self.current_period_end}"
 
 
 class Invoice(models.Model):
@@ -132,6 +132,9 @@ class Invoice(models.Model):
             )
         ]
 
+    def __str__(self):
+        return f"Invoice {self.id} tenant {self.tenant_id} {self.amount} {self.currency} {self.status} {self.period_start} -> {self.period_end}"
+
 
 class UsageEvent(models.Model):
     subscription = models.ForeignKey(Subscription, on_delete=models.PROTECT, related_name='usage_events')
@@ -140,6 +143,9 @@ class UsageEvent(models.Model):
     invoice = models.ForeignKey(Invoice, on_delete=models.SET_NULL, null=True, blank=True, related_name='usage_events')
     occurred_at = models.DateTimeField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"UsageEvent with the id of {self.id} is for subscription {self.subscription_id} with metric of {self.metric}, and quantity of {self.quantity}, occurred at {self.occurred_at}, has an invoice with id of {self.invoice_id}"
 
 
 
@@ -165,6 +171,8 @@ class LedgerEntry(models.Model):
             models.Index(fields=['tenant', 'account']),
         ]
 
+    def __str__(self):
+        return f"LedgerEntry with the id of {self.id} is for tenant {self.tenant_id} that has an invoice with the id : {self.invoice_id}, transaction_id : {str(self.transaction_id)[:8]}, account of {self.account}, with {self.amount} {self.currency}"
 
 class IdempotencyKey(models.Model):
 
@@ -192,3 +200,7 @@ class IdempotencyKey(models.Model):
                 name = 'unique_key_per_tenant'
             )
         ]
+
+    def __str__(self):
+        return f"IdempotencyKey with the id of {self.id} is for tenant {self.tenant_id}, with the key of {self.key[:12]}, response status of : {self.response_status}, with the state of : {self.state}"
+
