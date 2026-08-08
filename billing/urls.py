@@ -6,4 +6,5 @@ urlpatterns = [
     path('plans/', views.PlanCreateView.as_view(), name = 'create_plan'),
     path('subscriptions/', views.SubscriptionsCreateView.as_view(), name = 'create_subscription'),
     path('usage/', views.UsageEventListCreateView.as_view(), name = 'usage'),
+    path('invoice/', views.InvoiceAPIView.as_view(), name = 'invoice'),
 ]

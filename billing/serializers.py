@@ -84,3 +84,30 @@ class UsageEventSerializer(serializers.ModelSerializer):
             'subscription':{'read_only':True},
             'invoice':{'read_only': True},
         }
+
+
+class InvoiceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Invoice
+        fields = [
+            'id',
+            'tenant',
+            'amount',
+            'status',
+            'period_start',
+            'period_end',
+            'currency',
+            'created_at',
+            'paid_at'
+        ]
+
+        extra_kwargs = {
+            'tenant':{'read_only':True},
+            'amount':{'read_only':True},
+            'status':{'read_only':True},
+            'period_start':{'read_only':True},
+            'period_end':{'read_only':True},
+            'currency':{'read_only':True},
+            'created_at':{'read_only':True},
+            'paid_at':{'read_only':True},
+        }

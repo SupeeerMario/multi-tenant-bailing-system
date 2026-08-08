@@ -3,6 +3,7 @@ from django.db.models import Sum
 from decimal import Decimal, ROUND_HALF_UP
 from django.db import IntegrityError, transaction
 import uuid
+from dateutil.relativedelta import relativedelta
 
 class BillingError(Exception):
     pass
@@ -43,7 +44,9 @@ def generate_invoice(tenant, period_start, period_end):
             frozen.update(invoice = invoice)
             LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = uuid_val, account = 'ACCOUNTS_RECEIVABLE', amount = amount, currency = plan.currency)
             LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = uuid_val, account = 'REVENUE', amount = -amount, currency = plan.currency)
-
+            active_subscription.current_period_start = period_end
+            active_subscription.current_period_end = period_end + relativedelta(months=1)
+            active_subscription.save()
 
     except IntegrityError:
         raise InvoiceAlreadyExists(f"tenant {tenant.id} has already been invoiced a bill from {period_start} to {period_end}")
