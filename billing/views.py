@@ -5,6 +5,9 @@ from . import serializers, models, services
 from django.db import IntegrityError
 from rest_framework.exceptions import APIException
 from django.utils import timezone
+from dateutil.relativedelta import relativedelta
+
+
 # Create your views here.
 
 class SubscriptionAlreadyExists(APIException):
@@ -54,9 +57,11 @@ class SubscriptionsCreateView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         tenant= self.request.tenant
+        period_start = serializer.validated_data['current_period_start']
+        period_end = period_start + relativedelta(months = 1)
 
         try:
-            serializer.save(tenant = tenant)
+            serializer.save(tenant = tenant, current_period_end = period_end)
 
         except IntegrityError:
             raise SubscriptionAlreadyExists()

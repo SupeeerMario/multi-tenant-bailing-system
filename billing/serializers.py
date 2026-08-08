@@ -65,6 +65,7 @@ class SubscriptionsSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'tenant':{'read_only': True},
             'status':{'read_only': True},
+            'current_period_end':{'read_only' : True}
         }
 
 

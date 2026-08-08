@@ -1,5 +1,5 @@
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, F
 import uuid
 import secrets
 from django.core.exceptions import ValidationError
@@ -92,6 +92,10 @@ class Subscription(models.Model):
                 ],
                 condition = Q(status = 'ACTIVE'),
                 name = 'unique_active_subscription_per_tenant'
+            ),
+            models.CheckConstraint(
+                condition = Q(current_period_end__gt = F('current_period_start')),
+                name = 'prevent_zero_length_period'
             )
         ]
 

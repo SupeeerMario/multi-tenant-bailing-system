@@ -11,25 +11,20 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Decided 2026-08-08, before anything else is picked up. Both are under
-"Still not started, in order" in the Phase 2 section; the full reasoning is
-there.
+Updated 2026-08-08, end of the period-handling session. **Both of the previously
+queued blocking items are done**, and the dev database is back on baseline
+(`4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices / 8 ledger
+rows`, ledger sum `0.00`).
 
-1. **Move the closed-window guard out of `InvoiceAPIView` and into the service
-   layer.** Today the check lives in the view, so the Phase 4 worker calls
-   `generate_invoice` directly and bills periods that have not ended —
-   reintroducing exactly the bug decision 6 exists to prevent. A service function
-   holding *fetch active subscription → refuse if not closed → generate →
-   advance* gives the view and the worker one shared path. This is the only
-   queued item that is a correctness bug rather than a cleanup.
-2. **Add `CheckConstraint(current_period_end > current_period_start)` to
-   `Subscription`.** Subscription 11 (Initech) is `Aug 1 → Aug 1` and bills a
-   `base_fee`-only invoice with real ledger rows against a window that can match
-   no usage event. Needs a migration, and the existing bad row has to be fixed
-   before `AddConstraint` will apply.
+Nothing is blocking Phase 3 any more. The next item is the first entry under
+"Still not started, in order" in the Phase 2 section — **narrowing the bare
+`except IntegrityError` in `SubscriptionsCreateView.perform_create`**, which was
+looked at this session and deliberately deferred. Everything after it in that
+list is quality work.
 
-Do these two first, in this order. Everything else in that list is quality work
-and can wait.
+Phase 3 (idempotent payments) is unblocked and can start instead if preferred;
+the narrowing is a correctness-of-error-reporting issue, not a data-integrity
+one.
 
 ## Phase gating — read this first
 
@@ -271,6 +266,26 @@ real fixture or factory is Phase 5 work, but the cost is being paid now.
 back to **6 usage events, 4 tenants, 4 invoices, 8 ledger rows, 1 plan**. Use
 those five numbers as the check that the dev database is clean.
 
+**Drifted and cleaned again 2026-08-08.** A verification call ran outside its
+rollback block and billed Initech (15) on the zero-length `Aug 1 → Aug 1` window,
+writing invoice `41` (`20.00`) and ledger rows `33`/`34`. Deleted in that order —
+ledger pair first, then the invoice, because `Invoice` is `PROTECT`ed by
+`LedgerEntry`. A later round of HTTP endpoint probing added tenants `35`–`37` and
+subscriptions `70`/`72`; those were deleted too (subscriptions before tenants).
+Baseline reconfirmed at **4 tenants / 1 plan / 5 subscriptions / 6 usage events /
+4 invoices / 8 ledger rows**, ledger sum `0.00`.
+
+Subscription `11` was **deliberately left at `Aug 1 → Sep 1`** rather than reset
+to `Aug 1 → Aug 1` — the advance self-corrected it, and restoring the original
+value would recreate a row that `prevent_zero_length_period` now forbids.
+Initech therefore no longer serves as the `NoActiveSubscription` fixture it was
+originally created to be; a Phase 5 factory needs to provide that case
+explicitly.
+
+Third time ad-hoc rows have drifted from what this file claims. The lesson that
+keeps repeating: a verification call placed *after* the `with
+transaction.atomic():` body instead of inside it writes real rows.
+
 #### First three endpoints (2026-08-06, `c3086cb` + `13f695e`)
 
 `serializers.py`, `views.py`, `urls.py`, `admin.py` all have content now. Routes
@@ -324,6 +339,13 @@ plan returns 400 and never reaches `save()`;
 `unique_active_subscription_per_tenant` really is the only integrity error that
 can currently reach that handler. It becomes a liability the moment a second
 constraint lands on `Subscription`.
+
+**That moment arrived 2026-08-08** with `prevent_zero_length_period`, and the
+handler answered 409 "already has an active subscription" to a tenant that had
+none. Deriving `current_period_end` server-side closed the HTTP path, so the
+handler is not currently wrong for any reachable request — but it is still
+written to be wrong for the next constraint. See "Zero-length periods closed"
+and item 1 under "Still not started".
 
 #### Negative money closed (2026-08-07, `04bfbfd` + `73af90a`)
 
@@ -636,41 +658,245 @@ Traps hit, worth not re-learning:
   201 was declared missing when it was sitting at line ~1800 of 1844. Use
   `docker compose logs web | grep "POST /billing/invoice"` or `--tail=20 -f`.
 
+#### Window resolution moved into the service (2026-08-08)
+
+Closes the old queued item 1. `generate_invoice` now takes **only a tenant** and
+resolves everything else itself:
+
+```python
+def generate_invoice(tenant):
+```
+
+Order inside the function: resolve the ACTIVE subscription (`get()`, raises
+`NoActiveSubscription`) → bind `period_start` / `period_end` off
+`current_period_start` / `current_period_end` → guard
+`if period_end > timezone.now(): raise PeriodNotEnded(...)` → everything else
+unchanged. New `PeriodNotEnded(BillingError)` sits alongside the other two
+service exceptions. `django.utils.timezone` is now imported in `services.py` —
+that is not an HTTP concept, so it does not violate decision 2; `Response` and
+`Http404` are still the things that must never cross.
+
+`InvoiceAPIView.post()` now calls `services.generate_invoice(request.tenant)`.
+Its own subscription fetch and its own guard were **kept on purpose** — one extra
+query buys the friendlier 409 message, which is the same layering rule as the fee
+constraints (message in the outer layer, guarantee in the inner one).
+
+Why the parameters had to go rather than just gaining a guard: the view was never
+the only caller. A guard on `period_end` vs the clock stops an *open* window, but
+nothing stopped a caller passing a *closed* window that was not the
+subscription's own — and the advance at the end of the function trusts whatever
+it was handed. Two failure shapes, both silent:
+
+- **A stale window drags the cycle backwards.** `generate_invoice(acme, Jan 1,
+  Feb 1)` on a subscription at `Jul 1 → Aug 1` passes the guard, trips no unique
+  constraint, writes a `20.00` base-fee invoice with a real ledger pair, then
+  advances to `Feb 1 → Mar 1`. Every later call bills Feb, Mar, Apr… until it
+  crawls back to July and wedges on `InvoiceAlreadyExists` forever.
+- **An overlapping window silently double-counts.** `generate_invoice(acme, Jul
+  15, Aug 1)` is a distinct row under `unique_invoice_period` (`Jul 15 ≠ Jul 1`),
+  so no collision. `frozen.update(invoice=invoice)` then **moves** the events off
+  invoice 17 onto the new one, leaving 17 `OPEN` for `30.00` with zero events
+  attached and AR double-counting the same usage. Both ledger invariants still
+  pass — same blind spot as the negative-fee bug.
+
+Demonstrated live with the ten lines a Phase 4 worker would plausibly contain
+(`bill last complete calendar month`, the option decision 6 rejected), against a
+subscription one cycle behind at `Jun 1 → Jul 1`:
+
+```
+sub owes    : 2026-06-01 -> 2026-07-01
+worker bills: 2026-07-01 -> 2026-08-01
+invoice     : 2026-07-01 -> 2026-08-01 amount 22.50
+sub now     : 2026-08-01 -> 2026-09-01
+june event invoice_id: None
+```
+
+June is now behind the cursor and the advance only moves forward, so `30.00` of
+real usage can never bill. No exception raised; a worker logs it as a success.
+The June event sits at `invoice_id NULL`, byte-identical to the legitimately
+unbilled event 4 — the two states are indistinguishable by inspection.
+
+**Verified live 2026-08-08** on a throwaway tenant seeded at `Jun 1 → Jul 1` with
+usage in June and July, all inside a rolled-back transaction:
+
+| Call | Result | Window | Amount | Subscription after |
+|---|---|---|---|---|
+| 1 | invoice | Jun 1 → Jul 1 | `30.00` | Jul 1 → Aug 1 |
+| 2 | invoice | Jul 1 → Aug 1 | `22.50` | Aug 1 → Sep 1 |
+| 3 | `PeriodNotEnded` | — | — | unchanged |
+
+Each event landed on the correct invoice; windows tile with no gap. Acme →
+`InvoiceAlreadyExists` carrying its own period. The behind-by-a-cycle case that
+the old signature silently skipped now bills June first and stops on its own.
+
+Traps hit, worth not re-learning:
+
+- **`from django.utils import timezone` imports a module.** `timezone()` is
+  `TypeError: 'module' object is not callable`. Needs `timezone.now()`. Same
+  family as the `DeferredAttribute` trap — the name resolves, so nothing
+  complains until it runs.
+- **Removing the parameters is not the same as removing the window.** First cut
+  deleted `period_start` / `period_end` everywhere they appeared: the guard went
+  with them (leaving `PeriodNotEnded` as dead code and reopening the exact bug),
+  the usage filter lost its `occurred_at` bounds and started selecting *every*
+  event the subscription ever had, `Invoice.objects.create` stopped passing both
+  columns, and the advance disappeared. The change is where the values are
+  *read from*, not whether they exist.
+- **The broad `except IntegrityError` reported the wrong error.** With the
+  columns missing, `null value in column "period_start" ... violates not-null
+  constraint` was caught and re-raised as `InvoiceAlreadyExists`. Exactly the
+  liability already noted for `SubscriptionAlreadyExists` — a bare
+  `except IntegrityError` assumes only one integrity error can reach it. Worth
+  narrowing to a constraint-name check.
+- **`django.utils.timezone.utc` was removed in Django 5.** Use
+  `datetime.timezone.utc` in shell scripts. `AttributeError: module
+  'django.utils.timezone' has no attribute 'utc'. Did you mean: 'UTC'?`
+- **A verification call outside the rollback block writes real rows.** Invoice
+  41 and ledger 33/34 exist because one `generate_invoice` call sat after the
+  `with transaction.atomic():` body rather than inside it. See item 0 under
+  "Start here next session".
+
+#### Zero-length periods closed (2026-08-08, migration `0007`)
+
+Two layers landed together, and they do different jobs — same split as the
+negative-money work.
+
+**The guarantee: `prevent_zero_length_period` on `Subscription`.** Second entry
+in the existing `Meta.constraints` list, alongside
+`unique_active_subscription_per_tenant`:
+
+```python
+models.CheckConstraint(
+    condition = Q(current_period_end__gt = F('current_period_start')),
+    name = 'prevent_zero_length_period'
+)
+```
+
+`F` added to the `django.db.models` import in `models.py`. Migration
+`0007_subscription_prevent_zero_length_period` holds a single `AddConstraint`.
+Postgres renders it as
+`CHECK (current_period_end > current_period_start)`. No existing row violated it
+(checked with `filter(current_period_end__lte=F('current_period_start'))` first —
+`0` rows), so `AddConstraint` applied cleanly.
+
+Verified live with raw `objects.create()`, bypassing every serializer, all rolled
+back: `Aug 1 → Aug 1` and `Aug 1 → Jan 1` both `IntegrityError`, `Aug 1 → Sep 1`
+created. The backwards case is a bonus — `__gt` also blocks the
+`relativedelta(month=1)` cascade documented above, which would now fail at the
+database instead of silently wedging the billing cycle.
+
+**The message: the end is no longer client-supplied at all.**
+`current_period_end` is `read_only` in `SubscriptionsSerializer`, and
+`SubscriptionsCreateView.perform_create` derives it:
+
+```python
+period_start = serializer.validated_data['current_period_start']
+period_end = period_start + relativedelta(months = 1)
+serializer.save(tenant = tenant, current_period_end = period_end)
+```
+
+Same move as dropping `generate_invoice`'s window parameters: an ordering error
+becomes unrepresentable rather than merely rejected. It also stops the rule
+living in two places — `services.py` already advances by
+`relativedelta(months=1)` on every cycle, so a client-supplied end would have
+made cycle one a different length from every cycle after it.
+
+A serializer-level `validate()` comparing the two fields was written and then
+**deleted** — with the end derived, it had no job left, and a `read_only` field
+is stripped from `attrs`, so it could only ever `KeyError`. The DB constraint
+still covers admin, the shell, and the Phase 4 worker.
+
+`months=1` is hardcoded. `Plan.interval` (currently only `'MONTHLY'`) is the
+natural source for the step when a non-monthly plan appears.
+
+**Verified live over HTTP 2026-08-08**, throwaway tenants, all deleted after:
+
+| Case | Result |
+|---|---|
+| `POST subscriptions/` with `current_period_start` only | 201, `current_period_end` derived one month later |
+| second ACTIVE sub, same tenant | 409, correct duplicate message |
+| `current_period_end` spoofed in the body | ignored — `Jan 31` → `Feb 28`, not the value sent |
+| `current_period_start` omitted | 400 `{"current_period_start":["This field is required."]}` |
+
+`Jan 31 → Feb 28` confirms `relativedelta` clamps short months rather than
+overflowing into March.
+
+Traps hit, worth not re-learning:
+
+- **`CheckConstraint` requires `name=`.** `TypeError: CheckConstraint.__init__()
+  missing 1 required keyword-only argument: 'name'`. Same rule as
+  `UniqueConstraint` — migrations need a stable handle to drop and recreate.
+- **`Q` is the test, `F` is an operand.** `condition = F('current_period_start')`
+  names a column and compares nothing. `Q(...)` is always the outer wrapper; `F`
+  only ever appears *inside* it, as the right-hand side, and only when that side
+  is another column. `Q(end__gt = 'start')` without the `F` compares a datetime
+  to the literal string `'start'`.
+- **Both operands must be different fields.** `Q(current_period_start__gt =
+  F('current_period_start'))` is *start > start* — never true for any row, so
+  `AddConstraint` fails on every existing row and every future insert would be
+  rejected.
+- **`self` in `validate()` is the serializer, not the model.**
+  `self.current_period_end` is `AttributeError: 'SubscriptionsSerializer' object
+  has no attribute 'current_period_end'` — and it fires on *every* request,
+  including valid ones. The parsed values live in `attrs`.
+- **`request.data` is unparsed; `serializer.validated_data` is parsed.**
+  `request.data['current_period_start']` is the string
+  `'2026-08-01T00:00:00Z'`, so `+ relativedelta(...)` is `TypeError: can only
+  concatenate str (not "relativedelta") to str`. `validated_data` holds the real
+  timezone-aware `datetime`, and it is populated by the time `perform_create`
+  runs because `is_valid()` already succeeded.
+- **`str` has no `.decode()`** — `AttributeError: 'str' object has no attribute
+  'decode'`. `decode()` goes bytes → str, which is what the auth layer needed on
+  `get_authorization_header()`. Converting the value was never the fix; changing
+  which object it is read from was.
+- **`serializer.validated_data` without the key is the whole dict.**
+  `dict + relativedelta` is another `TypeError`.
+- **A second constraint immediately broke the bare `except IntegrityError`.**
+  CLAUDE.md predicted this before it happened: with `prevent_zero_length_period`
+  in place, a `POST` carrying `end == start` was caught by
+  `perform_create`'s handler and answered **409 "This tenant already has an
+  active subscription"** — for a tenant with no subscription at all. Deriving the
+  end made that path unreachable from HTTP, but the handler is still wrong for
+  the next constraint. See item 1 below.
+
 Still not started, in order:
 
-1. **Move the closed-window guard into the service layer.** It lives in the view
-   today, so the Phase 4 worker — which never runs a view — would call
-   `generate_invoice` directly and bill open periods, reintroducing the exact bug
-   the guard exists to stop. A service function holding *fetch subscription →
-   check closed → generate → advance* gives the view and the worker one shared
-   path, which is the whole point of decision 2. This is the only queued item
-   that is a correctness bug rather than a cleanup.
-2. **`CheckConstraint` on `Subscription`: `current_period_end >
-   current_period_start`.** Subscription 11 (Initech) is `Aug 1 → Aug 1`. A
-   zero-length window matches no events (`occurred_at >= X AND occurred_at < X`),
-   so it bills `base_fee` only and writes real ledger rows for it. Since the
-   advance landed it self-corrects to `Aug 1 → Sep 1` after one junk invoice, but
-   the invoice and its ledger pair are still wrong data. Same layering rule as the
-   fee constraints — the DB is the only layer the worker cannot bypass.
-3. Remaining read endpoints: invoices, ledger. Both need the same `get_queryset`
+1. **Narrow the bare `except IntegrityError` in
+   `SubscriptionsCreateView.perform_create`.** It reports every integrity error
+   as a duplicate subscription. Looked at 2026-08-08 and deferred, but the
+   discriminator was confirmed on this stack (psycopg 3.3.4):
+   `e.__cause__.diag.constraint_name` returns
+   `'unique_active_subscription_per_tenant'` for the duplicate and
+   `'prevent_zero_length_period'` for the check violation, and
+   `type(e.__cause__)` is `UniqueViolation` vs `CheckViolation`. Match on the
+   **name**, not the type — a second unique constraint would collide on type.
+   Guard the attribute access (`getattr(e.__cause__, 'diag', None)`; `__cause__`
+   can be `None`) and let anything unmatched re-raise as a 500 — an unanticipated
+   integrity error is a real server bug, and crashing beats answering 409 with a
+   confident wrong explanation. Note the cost: `e.__cause__.diag` is
+   psycopg-specific, so this ties `views.py` to the driver. Acceptable in a
+   Postgres-only project, but comment it. The constraint name also becomes a
+   string duplicated between `models.py` and `views.py` — pull it into a
+   module-level constant both reference.
+2. Remaining read endpoints: invoices, ledger. Both need the same `get_queryset`
    treatment; `Invoice` and `LedgerEntry` do have direct `tenant` FKs, so those
    filter without a join. `InvoiceSerializer` already exists and is already
    output-only, so the invoice one is mostly done.
-4. **URL naming.** The generate route is `billing/invoice/`, one character from
+3. **URL naming.** The generate route is `billing/invoice/`, one character from
    the `billing/invoices/` list route about to be added. Rename it to something
    that reads as an action — `billing/invoices/generate/` — before the collision
    exists.
-5. Nothing checks `plan.is_active` before subscribing. Not reachable over HTTP yet
+4. Nothing checks `plan.is_active` before subscribing. Not reachable over HTTP yet
    (`is_active` is read-only in `PlanSerializer`), but admin can deactivate a plan
    and the subscribe call still returns 201. A
    `PrimaryKeyRelatedField(queryset=Plan.objects.filter(is_active=True))` turns it
    into a 400.
-6. **No pagination on any list view.** `GET billing/usage/` returned all 12 rows
+5. **No pagination on any list view.** `GET billing/usage/` returned all 12 rows
    in one response. Usage events are the highest-volume table in the schema by a
    wide margin. `DEFAULT_PAGINATION_CLASS` + `PAGE_SIZE` in `REST_FRAMEWORK`
    applies to every list view at once — cheap now, Phase 5 otherwise. Ordering
-   (item 7) has to land first or alongside it.
-7. **No `Meta.ordering` on `UsageEvent`.** The list came back `[4, 1, 2, 3, 5, …]`
+   (item 6) has to land first or alongside it.
+6. **No `Meta.ordering` on `UsageEvent`.** The list came back `[4, 1, 2, 3, 5, …]`
    — Postgres returns rows in whatever order it likes without `ORDER BY`, and that
    order shifts as rows are updated. This becomes a correctness bug the moment
    pagination lands: unordered pagination silently drops and duplicates rows
@@ -1071,10 +1297,12 @@ operations (`unique_invoice_period`, `unique_key_per_tenant`) and the
 ## Repository hygiene
 
 `.gitignore` covers `.venv/`, `__pycache__/`, `*.pyc`, `db.sqlite3`, `.env`.
-Tracked file count is **29** as of `ff871e1`, unchanged from `73af90a` (was 26 at
-`7973e99`; `serializers.py` and migrations `0005`/`0006` account for the three) —
-if it jumps, something got committed that shouldn't have been. `ff871e1` touched
-five existing files and added none.
+Tracked file count is **29** as of `fb35920`, unchanged from `ff871e1` and
+`73af90a` (was 26 at `7973e99`; `serializers.py` and migrations `0005`/`0006`
+account for the three) — if it jumps, something got committed that shouldn't
+have been. `ff871e1` and `fb35920` each touched existing files only and added
+none. The zero-length-period work adds exactly one file, migration
+`0007_subscription_prevent_zero_length_period.py`, taking the count to **30**.
 
 `requirements.txt` gained `python-dateutil==2.9.0.post0` and its `six==1.17.0`
 dependency in `ff871e1`, for `relativedelta` in the period advance. A
