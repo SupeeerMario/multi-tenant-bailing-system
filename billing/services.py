@@ -18,6 +18,7 @@ class InvoiceAlreadyExists(BillingError):
 class PeriodNotEnded(BillingError):
     pass
 
+
 def generate_invoice(tenant):
     
     try:
@@ -63,3 +64,31 @@ def generate_invoice(tenant):
 
     
     return invoice
+
+
+def mock_payment_gateway(amount, currency, reference):
+    supported_currencies = ['USD', 'EUR', 'EGP']
+
+    if currency not in supported_currencies:
+        return {'status': 'declined', 
+                'code': 'wrong_currency'
+                }
+
+    if not reference:
+        return {'status': 'declined', 
+                'code': 'no_reference_number'
+                }
+
+
+    if amount == Decimal('66.66'):
+        return {'status': 'declined', 
+                'code': 'insufficient_funds'
+                }
+    
+        
+    return {'status': 'succeeded',
+            'charge_id': str(uuid.uuid4()),
+            'amount': str(amount), 
+            'currency': currency,
+            'reference': reference
+            }

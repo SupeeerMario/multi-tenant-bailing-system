@@ -11,20 +11,19 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Updated 2026-08-08, end of the period-handling session. **Both of the previously
-queued blocking items are done**, and the dev database is back on baseline
-(`4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices / 8 ledger
-rows`, ledger sum `0.00`).
+Updated 2026-08-08, end of the readability session (`__str__` on every model,
+plus the usage-list ordering tiebreaker). Dev database untouched and still on
+baseline (`4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices /
+8 ledger rows`, ledger sum `0.00`) — this session only read it.
 
-Nothing is blocking Phase 3 any more. The next item is the first entry under
-"Still not started, in order" in the Phase 2 section — **narrowing the bare
-`except IntegrityError` in `SubscriptionsCreateView.perform_create`**, which was
-looked at this session and deliberately deferred. Everything after it in that
-list is quality work.
+**Item 1 below is still the oldest unstarted item** — narrowing the bare
+`except IntegrityError` in `SubscriptionsCreateView.perform_create`. It was
+raised at the start of this session and skipped again by choice; the
+discriminator is already worked out and written down under item 1, so picking it
+up is mostly typing.
 
-Phase 3 (idempotent payments) is unblocked and can start instead if preferred;
-the narrowing is a correctness-of-error-reporting issue, not a data-integrity
-one.
+Phase 3 (idempotent payments) is unblocked and can start instead. Nothing in
+Phase 2's remainder is blocking it — items 1–6 are all quality work.
 
 ## Phase gating — read this first
 
@@ -37,7 +36,7 @@ remaining item rather than going along with it.
 | Phase | "Done when" | Status |
 |---|---|---|
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
-| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, ordering |
+| 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
@@ -859,6 +858,123 @@ Traps hit, worth not re-learning:
   end made that path unreachable from HTTP, but the handler is still wrong for
   the next constraint. See item 1 below.
 
+#### Ordering, and why it is not on the model (2026-08-08, `be5aff4`)
+
+`UsageEventListCreateView.get_queryset` now ends `.order_by('occurred_at', 'id')`.
+Rows come back chronological — `4 (Jun 20), 1 (Jul 2), 2 (Jul 15), 3 (Jul 31),
+5 (Aug 1)`. Under the previous `.order_by('id')` the June event sat mid-list.
+
+Two things had to be true, and they are separate:
+
+- **An `ORDER BY` at all.** Without one Postgres returns rows however it likes and
+  the order shifts as rows are updated. Under `LIMIT/OFFSET` pagination that means
+  page 2 can repeat a row from page 1 and drop another. Django warns
+  (`UnorderedObjectListWarning`) but does not stop it.
+- **A unique tiebreaker.** `occurred_at` alone is not enough — it is not unique,
+  and tied rows have no defined order among themselves, so pagination breaks again
+  on exactly the pages where a tie falls. `id` is the tiebreaker because it is
+  unique and already indexed.
+
+`occurred_at` over `id` as the primary key of the sort: `id` is insertion order,
+not event time, so a backdated event recorded today gets a high id and sorts last
+despite happening first.
+
+**`Meta.ordering` on the model was rejected**, with the cost understood. Model
+ordering would cover admin, the shell, the Phase 4 worker, and every future view
+in one line and one no-DDL migration. The view-level call covers one queryset.
+The asymmetry that makes this a real debt: item 5 turns pagination on with a
+**global** setting (`DEFAULT_PAGINATION_CLASS`), applying to every list view
+including ones written later, while its precondition is now **local and opt-in**.
+So:
+
+- Items 2's invoice and ledger views each need their own `order_by`.
+  `Invoice` → `('-period_start', 'id')`; `period_start` looks unique per tenant
+  under `unique_invoice_period` but that constraint spans
+  `(tenant, period_start, period_end)`, so two rows sharing a start with different
+  ends are legal and the tiebreaker is still required. `LedgerEntry` → `('id',)`
+  alone; the table is append-only by convention, so `id` is insertion sequence, is
+  chronological, and is unique. `created_at` is worse there — it is `auto_now_add`
+  evaluated once per row, so the two rows of a pair carry different timestamps.
+- **Item 5 must not land before those three `order_by` calls exist.**
+
+Unrelated to ordering but caused by pagination: a ledger `transaction_id` pair can
+straddle a page boundary, so a single page's rows will not sum to zero. Phase 5's
+ledger test has to read the database or every page, never one response.
+
+A trap worth not re-learning: `ordering = [...]` was first written in
+`UsageEventSerializer.Meta`. **Serializer `Meta` is not model `Meta`.** DRF reads a
+fixed set of keys off it (`model`, `fields`, `exclude`, `read_only_fields`,
+`extra_kwargs`, `depth`, `validators`, `list_serializer_class`); anything else is
+set as an attribute nobody reads. No error, no warning, no `ORDER BY` in the SQL —
+and `UsageEventSerializer.Meta.ordering` still prints the list, so the attribute
+really is there. A serializer has no queryset; it receives already-fetched objects
+and cannot influence SQL.
+
+#### `__str__` on every model (2026-08-08, `be5aff4`)
+
+All seven models print something readable now. `13f695e` had done `Tenant`,
+`Plan`, `Subscription`; this adds `Invoice`, `UsageEvent`, `LedgerEntry`,
+`IdempotencyKey`, and puts the row id into the first three.
+
+**No migration.** `__str__` is a method, not field state — Django does not track
+it. `makemigrations --check` reports `No changes detected`. Same as the
+`is_authenticated` property on `Tenant`.
+
+Three rules the final versions follow:
+
+- **`_id`, never the related object.** `f"{self.tenant}"` loads the `Tenant` row —
+  once per instance. Measured live: printing four invoices took **5 queries**
+  (one list + one per tenant); switching to `self.tenant_id` took **1**. An admin
+  page of 100 ledger rows would have been 101. The column is already in memory, so
+  `tenant_id` is free. It also matters for nullable FKs: `self.invoice.id` is
+  `AttributeError` on every unbilled usage event, `self.invoice_id` is `None`.
+- **Own id first.** The id is what every shell check, `PROTECT` error and
+  `invoice_id` stamp refers to — "delete ledger 33/34, then invoice 41" is
+  unusable if the lines do not carry ids.
+- **Truncate opaque and client-supplied fields.** `transaction_id` is 36 chars and
+  was the widest thing on a 185-char ledger line; `str(self.transaction_id)[:8]`
+  brought it to 157, which fits one terminal row. The value is never read, only
+  *matched* between two rows, and 8 hex digits does that. `IdempotencyKey.key` is
+  `max_length=512` and **client-supplied** (it arrives in the `Idempotency-Key`
+  header, so the client picks the length) — `[:12]`. `response_body` (a whole
+  JSONField payload) and `request_hash` (64 chars) were dropped from the output
+  entirely. That table is empty today and fills in Phase 3, which is exactly when
+  these rows get stared at.
+
+The check that these work: print all 8 ledger rows and see whether the four pairs
+are spottable at a glance. They are — same 8-char `transaction_id`, `+30.00` and
+`-30.00`, adjacent.
+
+Timestamps are printed **in full**, not `.date()`. Deliberate: a non-midnight
+boundary is a live symptom, since `SubscriptionsSerializer` still accepts
+`current_period_start` unnormalized and a cycle seeded at `T13:47:22.813Z` carries
+that offset into every window forever (see the uniqueness item under Schema and
+code cleanups). `.date()` would hide it.
+
+Traps hit, worth not re-learning:
+
+- **`.date` without the parens is a bound method, and it formats fine.**
+  `f"{self.period_start.date}"` renders
+  `<built-in method date of datetime.datetime object at 0x723205931bf0>`. Nothing
+  raises — it is a real object with a real `repr`. Shipped into four places at
+  once (`Subscription` ×2, `Invoice` ×2). Same family as bare `uuid.uuid4` passed
+  as a value and `Subscription.current_period_end` read off the class: the name
+  resolves, so the failure surfaces in output rather than a traceback.
+- **`UUID` objects are not subscriptable.** `self.transaction_id[:8]` is
+  `TypeError: 'UUID' object is not subscriptable`. `str()` first. A `CharField`
+  is already a string and needs no `str()`.
+- **Slicing never raises on short strings.** `'short-key'[:12]` returns
+  `'short-key'` — no exception, no padding — so a truncation needs no length
+  guard.
+- **`__str__` must return `str`.** `return self.id` gives `TypeError: __str__
+  returned non-string (type int)`, and only when something prints the object —
+  `manage.py check` passes.
+- **A trailing whitespace-only line still counts as no newline at EOF.** The fix
+  attempt left the file ending `}"\n` plus four spaces, so
+  `\ No newline at end of file` kept firing on the blank line. The visible cost is
+  in the diff: the previous last line shows as removed and re-added even though it
+  was untouched, because appending below it forced a newline onto its end.
+
 Still not started, in order:
 
 1. **Narrow the bare `except IntegrityError` in
@@ -894,13 +1010,14 @@ Still not started, in order:
 5. **No pagination on any list view.** `GET billing/usage/` returned all 12 rows
    in one response. Usage events are the highest-volume table in the schema by a
    wide margin. `DEFAULT_PAGINATION_CLASS` + `PAGE_SIZE` in `REST_FRAMEWORK`
-   applies to every list view at once — cheap now, Phase 5 otherwise. Ordering
-   (item 6) has to land first or alongside it.
-6. **No `Meta.ordering` on `UsageEvent`.** The list came back `[4, 1, 2, 3, 5, …]`
-   — Postgres returns rows in whatever order it likes without `ORDER BY`, and that
-   order shifts as rows are updated. This becomes a correctness bug the moment
-   pagination lands: unordered pagination silently drops and duplicates rows
-   across pages, and Django warns about it.
+   applies to every list view at once — cheap now, Phase 5 otherwise. **Do not
+   land this before every list view has its own `order_by`** — see item 6 for why
+   that ordering is per-view rather than per-model here.
+6. ~~**No `Meta.ordering` on `UsageEvent`.**~~ **Handled at the view, 2026-08-08.**
+   `UsageEventListCreateView.get_queryset` ends `.order_by('occurred_at', 'id')`.
+   `Meta.ordering` on the model was considered and **deliberately rejected** — see
+   the "Ordering" subsection in Phase 2 for the tradeoff and for the standing debt
+   that choice creates for items 2 and 5.
 
 ## How to work with me on this
 
@@ -1230,10 +1347,10 @@ Schema and code cleanups:
   generator.
 - ~~`Subscription.status` has no default~~ — fixed in `6c95a9f`,
   `default='ACTIVE'`.
-- ~~No `__str__` on any model~~ — partly fixed in `13f695e`. `Tenant`, `Plan`,
-  `Subscription` have one. `Invoice`, `UsageEvent`, `LedgerEntry`, and
-  `IdempotencyKey` still print as `<Invoice: Invoice object (17)>`, and those are
-  the four that matter most for reading ledger checks in the shell.
+- ~~No `__str__` on any model~~ — **fully closed 2026-08-08.** `13f695e` did
+  `Tenant`, `Plan`, `Subscription`; `be5aff4` added `Invoice`,
+  `UsageEvent`, `LedgerEntry`, `IdempotencyKey` and put the row id into the
+  first three. See the "`__str__` on every model" subsection in Phase 2.
 - ~~`billing/admin.py` registers nothing~~ — fixed in `c3086cb`, all seven
   registered.
 - `Plan.clean()` guards with `if self.base_fee and self.unit_fee:`. `Decimal('0')`
@@ -1303,6 +1420,9 @@ account for the three) — if it jumps, something got committed that shouldn't
 have been. `ff871e1` and `fb35920` each touched existing files only and added
 none. The zero-length-period work adds exactly one file, migration
 `0007_subscription_prevent_zero_length_period.py`, taking the count to **30**.
+Confirmed at **30** on 2026-08-08. The `__str__` and ordering work touched
+`models.py` and `views.py` only and generated no migration, so the count is
+unchanged by it.
 
 `requirements.txt` gained `python-dateutil==2.9.0.post0` and its `six==1.17.0`
 dependency in `ff871e1`, for `relativedelta` in the period advance. A
