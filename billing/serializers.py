@@ -112,3 +112,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
             'created_at':{'read_only':True},
             'paid_at':{'read_only':True},
         }
+
+
+class PaymentSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)

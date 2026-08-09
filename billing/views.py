@@ -6,7 +6,7 @@ from django.db import IntegrityError
 from rest_framework.exceptions import APIException
 from django.utils import timezone
 from dateutil.relativedelta import relativedelta
-
+from decimal import Decimal
 
 # Create your views here.
 
@@ -35,7 +35,27 @@ class InvoiceAlreadyExists(APIException):
     default_code = 'invoice_already_billed'
 
 
+class NoInvoiceToPay(APIException):
+    status_code = status.HTTP_404_NOT_FOUND
+    default_detail = 'no invoice to pay'
+    default_code = 'no_invoice_to_pay'
 
+
+class InvoiceAlreadyPaid(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = 'invoice already paid'
+    default_code = 'invoice_already_paid'
+
+
+class AmountMissMatch(APIException):
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_detail = 'invoice amount does not match the amount passed'
+    default_code = 'amount_missmatch'
+
+class PaymentDeclined(APIException):
+    status_code = status.HTTP_402_PAYMENT_REQUIRED
+    default_detail = 'payment declined'
+    default_code = 'payment_declined'
 
 class TenantCreateView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
@@ -112,3 +132,42 @@ class InvoiceAPIView(APIView):
         
         invoice_data = serializers.InvoiceSerializer(invoice).data
         return Response(invoice_data, status=status.HTTP_201_CREATED)
+
+
+class InvoicesPay(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = serializers.InvoiceSerializer
+
+    def post(self, request, pk):
+        tenant = self.request.tenant
+
+        try:
+            invoice = models.Invoice.objects.get(id = pk, tenant = tenant)
+        except models.Invoice.DoesNotExist:
+            raise NoInvoiceToPay
+
+
+
+
+        s = serializers.PaymentSerializer(data = request.data)
+        s.is_valid(raise_exception=True)
+        amount = s.validated_data['amount']
+
+
+
+        try:
+            pay = services.pay_invoice(tenant, invoice.id, amount)
+        except services.InvoiceNotFound as e:
+            raise NoInvoiceToPay(e)
+        except services.InvoiceAlreadyPaid as e:
+            raise InvoiceAlreadyPaid(e)
+        except services.AmountMismatch as e:
+            raise AmountMissMatch(e)
+        except services.PaymentDeclined as e:
+            raise PaymentDeclined(e)
+
+        invoice_data = serializers.InvoiceSerializer(pay).data
+
+
+        return Response(invoice_data, status=status.HTTP_200_OK)
+    

@@ -11,19 +11,26 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Updated 2026-08-08, end of the readability session (`__str__` on every model,
-plus the usage-list ordering tiebreaker). Dev database untouched and still on
-baseline (`4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices /
-8 ledger rows`, ledger sum `0.00`) — this session only read it.
+Updated 2026-08-09, end of the first Phase 3 session. **Phase 3 is started and
+roughly half built** — the mock gateway, `pay_invoice`, and the pay endpoint all
+work end to end. What is missing is the actual hero feature: the
+`Idempotency-Key` claim. See "Phase 3 — where it stands" for the full picture.
 
-**Item 1 below is still the oldest unstarted item** — narrowing the bare
-`except IntegrityError` in `SubscriptionsCreateView.perform_create`. It was
-raised at the start of this session and skipped again by choice; the
-discriminator is already worked out and written down under item 1, so picking it
-up is mostly typing.
+**Next action: claim the key.** The design is settled and written down; the step
+order is in the Phase 3 section under "The claim, and why the order is the whole
+point". Nothing is blocking it.
 
-Phase 3 (idempotent payments) is unblocked and can start instead. Nothing in
-Phase 2's remainder is blocking it — items 1–6 are all quality work.
+The current pay path **double-charges under concurrency** — proved live this
+session, two simultaneous calls both charging a `30.00` invoice for a `CASH`
+total of `60.00`, with the ledger still summing to `0.00`. That output is Phase
+3 deliverable material; keep it.
+
+Dev database is on baseline (`4 tenants / 1 plan / 5 subscriptions / 6 usage
+events / 4 invoices / 8 ledger rows`, ledger sum `0.00`). Two throwaway tenants
+(`38 PayTest`, `39 RaceTest`) were created and fully deleted this session.
+
+Still the oldest unstarted Phase 2 item, untouched for a third session: narrowing
+the bare `except IntegrityError` in `SubscriptionsCreateView.perform_create`.
 
 ## Phase gating — read this first
 
@@ -37,7 +44,7 @@ remaining item rather than going along with it.
 |---|---|---|
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
 | 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
-| 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | Blocked on 2 |
+| 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **In progress** (2026-08-09) — gateway, `pay_invoice`, and `POST billing/invoices/<pk>/pay/` done and verified. `Idempotency-Key` not started, so the "Done when" is **not** met: a retry currently returns 409 rather than the original response, and concurrent calls double-charge |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
 | 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
@@ -284,6 +291,15 @@ explicitly.
 Third time ad-hoc rows have drifted from what this file claims. The lesson that
 keeps repeating: a verification call placed *after* the `with
 transaction.atomic():` body instead of inside it writes real rows.
+
+**No drift on 2026-08-09.** The Phase 3 payment work needed real writes (a
+payment cannot be verified inside a rolled-back block if you want to curl it), so
+it ran on two throwaway tenants — `38 PayTest` with invoices `42`/`43`, and
+`39 RaceTest` with two more for the concurrency test. Both fully deleted
+afterwards, ledger rows first, then invoices, then the tenant, because
+`LedgerEntry` `PROTECT`s `Invoice`. Baseline reconfirmed at
+**4 / 1 / 5 / 6 / 4 / 8**, ledger sum `0.00`. Deliberately did **not** pay Acme's
+invoice 17 — that would have permanently changed the documented baseline.
 
 #### First three endpoints (2026-08-06, `c3086cb` + `13f695e`)
 
@@ -998,10 +1014,10 @@ Still not started, in order:
    treatment; `Invoice` and `LedgerEntry` do have direct `tenant` FKs, so those
    filter without a join. `InvoiceSerializer` already exists and is already
    output-only, so the invoice one is mostly done.
-3. **URL naming.** The generate route is `billing/invoice/`, one character from
-   the `billing/invoices/` list route about to be added. Rename it to something
-   that reads as an action — `billing/invoices/generate/` — before the collision
-   exists.
+3. ~~**URL naming.**~~ **Done 2026-08-09.** `billing/invoice/` is now
+   `billing/invoices/generate/` (name `generate_invoices`), renamed as part of
+   adding `billing/invoices/<int:pk>/pay/` rather than after the collision
+   existed.
 4. Nothing checks `plan.is_active` before subscribing. Not reachable over HTTP yet
    (`is_active` is read-only in `PlanSerializer`), but admin can deactivate a plan
    and the subscribe call still returns 201. A
@@ -1018,6 +1034,235 @@ Still not started, in order:
    `Meta.ordering` on the model was considered and **deliberately rejected** — see
    the "Ordering" subsection in Phase 2 for the tradeoff and for the standing debt
    that choice creates for items 2 and 5.
+
+## Phase 3 — where it stands (2026-08-09)
+
+Built and verified: `mock_payment_gateway` (`e5dd899`), then `pay_invoice`,
+`InvoicesPay`, `PaymentSerializer` and the URL rename. Not built: the
+`Idempotency-Key` claim, which is the whole point of the phase.
+
+| Route | View | Permission | Body |
+|---|---|---|---|
+| `POST billing/invoices/generate/` | `InvoiceAPIView` | `IsAuthenticated` | none |
+| `POST billing/invoices/<int:pk>/pay/` | `InvoicesPay` | `IsAuthenticated` | `{"amount": "30.00"}` |
+
+`pay_invoice(tenant, invoice_id, amount)` in `services.py`: resolve the invoice
+with `get(tenant=tenant, id=invoice_id)` → refuse if not `OPEN` → refuse if
+`invoice.amount != amount` → call the gateway → raise `PaymentDeclined` and write
+**nothing** on a decline → otherwise, in one `transaction.atomic()`, set
+`status='PAID'` and `paid_at`, save, and write the `CASH +amount` /
+`ACCOUNTS_RECEIVABLE -amount` pair sharing one `transaction_id` → `return
+invoice`. Four new `BillingError` subclasses (`InvoiceNotFound`,
+`InvoiceAlreadyPaid`, `AmountMismatch`, `PaymentDeclined`) with `APIException`
+twins in `views.py` at 404 / 409 / 400 / 402.
+
+**Verified live 2026-08-09** on throwaway tenant `38`, invoices `42` (`30.00`)
+and `43` (`66.66`):
+
+| Case | Result |
+|---|---|
+| pay 42 `"30.00"` | 201→**200**, `status PAID`, `paid_at` set |
+| pay 42 again | **409** `invoice already paid` |
+| pay 43 `"66.66"` | **402** `payment declined`, invoice still `OPEN`, zero rows written |
+| pay 43 `"10.00"` | **400** `amount mismatch` |
+
+Ledger for invoice 42: exactly 2 rows, 1 distinct `transaction_id`, `AR -30.00` /
+`CASH +30.00`, sum `0.00`. Earlier round against the real seed data also
+confirmed Globex asking for Acme's invoice 17 gets **404**, byte-identical to a
+nonexistent invoice — the response leaks nothing about whether the row exists.
+
+### The double-charge is real, and it is the deliverable's "before"
+
+`if invoice.status != 'OPEN'` already blocks a **sequential** retry, so the naive
+version does not double-charge when you simply call it twice — it answers 409.
+Four concurrent curls against the running stack also produced one 200 and three
+409s, because the mock gateway returns instantly and the read-to-write window is
+microseconds.
+
+Widening that window to what a real gateway costs — monkeypatching a `0.3s` sleep
+around `mock_payment_gateway` in a shell, two threads calling `pay_invoice` —
+reproduces it immediately:
+
+```
+[(0, 'CHARGED'), (1, 'CHARGED')]
+ledger rows 4   distinct txn 2
+CASH total 60.00      <- on a 30.00 invoice
+sum 0.00
+```
+
+Both charged. **The ledger still sums to `0.00`** — fourth time in this project
+that the sum-to-zero invariant has gone green on corrupt data (after negative
+fees, the stale-window invoice, and the overlapping-window invoice). The lesson
+repeats: sum-to-zero proves the pairs are well-formed, never that they should
+exist.
+
+The race window spans from the invoice read to the ledger write, and the gateway
+round trip sits inside it — so in production it is hundreds of milliseconds wide,
+not microseconds. A double-clicked Pay button or a client retrying on a 300ms
+timeout hits it.
+
+### The claim, and why the order is the whole point
+
+1. Read the `Idempotency-Key` header; missing → 400, it is required.
+2. `request_hash` = sha256 hexdigest over `json.dumps({'invoice': <pk>,
+   **request.data}, sort_keys=True)`.
+3. `IdempotencyKey.objects.create(..., state='PROCESSING')`.
+4. On `IntegrityError` the key is already claimed — read the existing row and
+   branch: hash differs → **422**; `state='PROCESSING'` → **409** in flight;
+   `state='COMPLETED'` → return the stored `response_status` / `response_body`.
+5. Only then the gateway and the writes, finishing by stamping the row
+   `COMPLETED` with the response.
+
+**The claim must commit before the gateway call.** Putting step 3 inside the same
+`atomic()` block as the ledger writes means a rollback erases the claim and the
+gate never existed. `ATOMIC_REQUESTS` is not set so autocommit gets this right by
+default — do not "tidy" it into the block later.
+
+Why the constraint and not an `if`: both requests `INSERT` the same
+`(tenant, key)`, Postgres serializes them, one wins and the other gets
+`IntegrityError`. There is no interleaving where both pass, because the unique
+index fuses the check and the write. `if invoice.status != 'OPEN'` is a `SELECT`
+and a later `UPDATE` with a gap between them. Same reasoning as
+`unique_active_subscription_per_tenant`.
+
+**Limit worth knowing:** this only works when both requests carry the *same* key.
+A double-click that generates two different keys still double-charges — two
+different rows, no collision. The contract is the client's: one key per logical
+payment, generated before the first attempt, reused on every retry. A server-side
+backstop would be `UniqueConstraint(fields=['invoice', 'account'])` on
+`LedgerEntry`, which blocks a second `CASH` row outright — but it also blocks a
+refund's reversing pair, so it is a real tradeoff and not Phase 3 work.
+
+### Decisions made this session
+
+- **Routing: the invoice pk goes in the URL** (`invoices/<pk>/pay/`), not the
+  body and not implied. Rejected "pay the tenant's oldest OPEN invoice with no
+  id" — which was the preferred option until the author spotted that it makes
+  `request_hash` useless. With no pk, the only client-supplied field is `amount`,
+  and `base_fee` guarantees repeated amounts: every zero-usage month bills
+  exactly `20.00` (invoice 19 already does). Two genuinely different payments
+  then fingerprint identically, so a reused key looks like a retry and the second
+  invoice is silently never paid.
+- **Hash only what the client sent.** Folding the server-resolved invoice id into
+  the fingerprint does not rescue the no-pk design either: after invoice 17 is
+  paid, "oldest OPEN" resolves to 18, the recomputed hash differs from the stored
+  one, and a *legitimate* retry is rejected as a client error. Server state moves
+  between the original request and the retry; client input does not.
+- **The pk lives in the URL, so it is not in `request.data`.** Hashing
+  `request.data` alone rebuilds the collision above with code that looks correct.
+  The hash input has to merge `self.kwargs['pk']` with the body.
+- **The gateway takes no card number.** A `cardnumber` argument was written and
+  removed: card numbers reaching your API puts you in PCI scope, and they would
+  land in `request_hash` input and in every traceback. A real gateway already
+  holds the card. If a card-shaped input is ever wanted, it is an opaque token
+  (`tok_visa`), not a PAN.
+- **A decline is the gateway's answer, not an error** — it must be stored and
+  replayed, so a retry of a declined payment returns the same decline rather than
+  re-attempting the card. Currently raised as `PaymentDeclined` for simplicity;
+  when the key lands, the receipt has to survive into `response_body`, so either
+  the exception carries it or the service returns it.
+- **Payment logic lives in `services.py`, not the view.** Briefly decided the
+  other way and reversed. The deciding argument is CLAUDE.md's own requirement
+  that the key row, the ledger pair and the invoice update land in one atomic
+  transaction — impossible if the key is managed in the view while the ledger is
+  written in the service. Consequence: `key` and `request_hash` should be
+  parameters of `pay_invoice`, with the view only reading the header and
+  computing the hash.
+- **`pay_invoice` takes `invoice_id`, not an `Invoice`.** Same move as dropping
+  `generate_invoice`'s window parameters: hand the service a resolved object and
+  a caller can hand it one belonging to another tenant. Resolving inside with
+  `get(tenant=tenant, id=invoice_id)` makes that unrepresentable.
+- **Past-due policy: cancel rather than accrue.** `PAST_DUE` at 7 days unpaid,
+  `CANCELED` after. Chosen over three alternatives once the author noticed that a
+  suspended tenant keeps accruing `base_fee` for months it was locked out of —
+  six months away would owe `120.00` for zero access. `CANCELED` is not `ACTIVE`,
+  so `generate_invoice` raises `NoActiveSubscription` and accrual stops. Both
+  status flips need a scheduler, so this is **Phase 4 work**; `PAST_DUE` already
+  exists in `SUBSCRIPTIONS_CHOICES`, unused since Phase 1.
+- **One OPEN invoice per tenant** — agreed, not built. `UniqueConstraint(fields=
+  ['tenant'], condition=Q(status='OPEN'), name='unique_open_invoice_per_tenant')`
+  is `unique_active_subscription_per_tenant` with two words changed. It cannot be
+  added yet: `AddConstraint` validates existing rows and Acme has **three** OPEN
+  invoices (`17`, `18`, `19`), so it fails exactly like the `-99.00` plan did.
+  Pay or void two first. Note the guard belongs at the top of `generate_invoice`,
+  before the `atomic()` block — placed there the period advance never runs, so
+  the cycle *pauses* on an unpaid invoice rather than sliding past unbilled usage.
+
+### Traps hit, worth not re-learning
+
+- **`Decimal('0')` is falsy, third appearance.** `if not amount:` in the gateway
+  would decline a legitimate `0.00` invoice from a free plan — a shape decision 5
+  explicitly made legal. Guard numbers on `is None`. (`Plan.clean()` still has
+  this bug live.)
+- **`json.dumps` is the only test that counts for a receipt.** The gateway dict is
+  destined for `response_body`, a `JSONField`. `Decimal` and `UUID` both print
+  fine, compare fine, and raise `Object of type X is not JSON serializable` at
+  storage time. Hit twice in a row — once on `amount`, once on `charge_id`. Only
+  `str`/`int`/`float`/`bool`/`None`/`list`/`dict` may appear.
+- **`cardnumber.len` is an attribute that does not exist**; `len()` is a builtin.
+  `AttributeError: 'str' object has no attribute 'len'`. It hid behind a
+  short-circuit — `if not cardnumber or cardnumber.len < 13` never evaluates the
+  second operand when the first is falsy, so the *empty* case passed cleanly and
+  only the success path crashed.
+- **A bare `class` keyword is a `SyntaxError`**, and so is an incomplete call
+  (`account= ,amount = amount`). Both are import-time, so `check`, the URLconf
+  and the container all go down. Third and fourth import-time failure in this
+  project.
+- **Exception classes must subclass `APIException`, not `APIView`.** All three new
+  ones were written as `APIView` first; `status_code`/`default_detail` are inert
+  there and `raise <view class>` is `TypeError: exceptions must derive from
+  BaseException`.
+- **The status check was written inverted.** `if invoice.status == 'OPEN': raise
+  InvoiceAlreadyPaid` refuses every payable invoice and lets a `PAID` one be
+  charged again. `OPEN` means unpaid.
+- **`request.data.get['amount']`** subscripts the bound method:
+  `'builtin_function_or_method' object is not subscriptable`.
+- **Comparing a `Decimal` to a `str` is silently always unequal.**
+  `Decimal(str(x)) != str(invoice.amount)` made every payment a mismatch. The
+  `str()` belongs on the *input*, to dodge float expansion, never on the invoice.
+- **`Decimal(str(x))` turns every bad input into one `InvalidOperation`** —
+  `None`, `''`, `'abc'`, `True`, `[]` all raise it, so all five were 500s. Two
+  inputs that do *not* fail are more interesting: `'  30.00  '` is accepted with
+  whitespace stripped, and `'1e3'` parses as `1000`. A
+  `serializers.DecimalField(max_digits=12, decimal_places=2)` handles required,
+  type, and precision in one declaration and returns field-keyed 400s matching
+  the rest of the API — `"30.001"` becomes *"no more than 2 decimal places"*
+  instead of a misleading *"amount does not match"*.
+- **`PaymentSerializer` is a plain `serializers.Serializer`,** the first in the
+  project. A payment body is not a row, so there is no `Meta.model` for
+  `ModelSerializer` to read. It is used purely as a validator; `.save()` is never
+  called (and would need a hand-written `create()`). Rule of thumb: body maps to
+  a row → `ModelSerializer`; body is arguments to an action → `Serializer`.
+- **`filter()` where `get()` was meant — seventh appearance.**
+  `invoice = Invoice.objects.filter(id=invoice_id)` then `invoice.status` is
+  `AttributeError: 'QuerySet' object has no attribute 'status'`, and the
+  `except Invoice.DoesNotExist` below it is unreachable because `filter()` never
+  raises.
+- **A parameter accepted and never used is an isolation hole.** `pay_invoice`
+  took `tenant` and looked up `filter(id=invoice_id)` without it — any tenant
+  could pay any invoice by id. It was masked only by the view's duplicate lookup,
+  which was about to be deleted.
+- **`except: pass` and `except: raise PaymentDeclined` are both worse than no
+  handler.** The second is the dangerous one: the gateway has *already
+  succeeded*, so an internal error after it gets reported to the customer as
+  "declined" while their account is debited, and they retry. A 500 is the honest
+  answer — "something broke, state unknown".
+- **Three ledger rows do not sum to zero.** Adding `CASH` while keeping `REVENUE`
+  gave `REVENUE +30 / AR -30 / CASH +30` = `+30.00`. A payment is exactly two
+  rows; the revenue was already booked at invoice time. Keeping `REVENUE` and
+  dropping `CASH` is the other failure — every account nets to zero and the books
+  claim you earned nothing, hold nothing, and are owed nothing after being paid.
+- **The view and the service hold two different `Invoice` instances of the same
+  row.** Serializing the view's copy after the service mutated its own returns
+  `status: "OPEN"`, `paid_at: null` on a *successful* payment. Serialize what the
+  service returns — which also means the service has to `return invoice`, easy to
+  omit since the function ends on a `create()` call.
+- **Deleting the view's duplicated checks made the service's exceptions
+  unreachable, then removing the `try` made them 500s.** `BillingError` subclasses
+  are invisible to DRF. The `except services.X as e: raise <twin>(e)` clauses are
+  load-bearing, and the `services.` prefix is mandatory now that
+  `InvoiceAlreadyPaid` exists in both files — a bare `except InvoiceAlreadyPaid:`
+  binds the view's own class, which the service never raises.
 
 ## How to work with me on this
 
@@ -1088,6 +1333,24 @@ Invariants that tests will assert:
 - Outstanding balance = sum of `amount` where account is `ACCOUNTS_RECEIVABLE`.
 - Ledger rows are append-only. Never update or delete a row to fix a mistake.
   Write a reversing pair instead.
+
+**Sum-to-zero proves the pairs are well-formed. It never proves they should
+exist.** Four separate bugs have passed it: a negative-fee plan, a stale-window
+invoice, an overlapping-window invoice, and a concurrent double-charge (two
+correct pairs, `CASH 60.00` on a `30.00` invoice, total `0.00`). A test asserting
+only sum-to-zero goes green on all four. The invariant that catches three of them
+is `sum(ACCOUNTS_RECEIVABLE)` equalling the tenant's outstanding `OPEN` invoices;
+the fourth needs a row count.
+
+Which movement writes which pair:
+- **Invoicing** — `ACCOUNTS_RECEIVABLE +amount` / `REVENUE -amount`. You earned
+  it, you are owed it.
+- **Payment** — `CASH +amount` / `ACCOUNTS_RECEIVABLE -amount`. The same money
+  moves from owed to held; AR nets to zero and the revenue stays booked.
+
+Reusing `REVENUE` on the payment instead of `CASH` sums to zero and passes both
+invariants, but cancels the revenue — the books then say you earned nothing, hold
+nothing, and are owed nothing after a customer paid.
 
 When a payment succeeds, the idempotency row, the two ledger rows, and the
 invoice update must all be written in a single atomic transaction
@@ -1302,6 +1565,41 @@ them unilaterally.
    both); "+1 month" has no single right answer for a Jan 31 start, so storing the
    end means a human decided once instead of every caller deciding the same way;
    and a non-monthly plan later needs no schema change.
+7. ~~**How a pay request names its invoice, and what the fingerprint covers.**~~
+   **DECIDED 2026-08-09: pk in the URL, hash over pk + body.**
+   `POST billing/invoices/<int:pk>/pay/` with `{"amount": "..."}`, scoped by
+   `tenant=request.tenant` so another tenant's invoice is a 404 identical to a
+   nonexistent one. `request_hash` is sha256 over
+   `{'invoice': <pk>, **request.data}` with `sort_keys=True`.
+
+   Rejected: **no id, pay the tenant's oldest OPEN invoice.** Preferred until the
+   `base_fee` collision surfaced — with `amount` as the only client-supplied
+   field, every zero-usage month bills exactly `20.00`, so two different payments
+   fingerprint identically and a reused key silently swallows the second. Also
+   rejected the repair of folding the server-resolved id into the hash: after 17
+   is paid the resolution moves to 18, so a legitimate retry recomputes a
+   different hash and is rejected as a client error. **Hash only client-supplied
+   input** — server state moves between the original request and the retry.
+
+   Full reasoning, including why the pk is not in `request.data`, in the Phase 3
+   section.
+8. ~~**What happens to a tenant that does not pay.**~~ **DECIDED 2026-08-09:
+   `PAST_DUE` at 7 days, `CANCELED` after — cancel rather than accrue.** Both
+   flips need a scheduler, so this is Phase 4 work. `PAST_DUE` already exists in
+   `SUBSCRIPTIONS_CHOICES` and has been unused since Phase 1.
+
+   Chosen because a suspended tenant otherwise keeps accruing `base_fee` for
+   months it was locked out of — `generate_invoice` and the usage endpoint both
+   resolve the subscription with `get(status='ACTIVE')`, so `PAST_DUE` already
+   blocks recording usage, and six months suspended would still owe `120.00` for
+   zero access. `CANCELED` is not `ACTIVE`, so `NoActiveSubscription` is raised
+   and accrual stops.
+
+   Rejected: skipping `base_fee` for fully-suspended periods (needs a
+   "suspended since" field `Subscription` does not have); jumping
+   `current_period_start` past the gap on payment (loses usage in the gap, though
+   there is none while locked out); accruing anyway as debt (defensible for
+   contract billing, wrong for self-serve).
 
 ## Known open items
 
@@ -1358,6 +1656,17 @@ Schema and code cleanups:
   (nothing in the block would reject zero) but it silently disables any check
   added there later. Guard on `is not None`.
 - Consider migrating existing choice sets to `TextChoices`.
+- `unique_open_invoice_per_tenant` is agreed and unbuilt. `AddConstraint` will
+  fail until Acme is down to one OPEN invoice — it currently has `17`, `18`, `19`.
+  See the Phase 3 section for the shape and for why the matching guard belongs at
+  the top of `generate_invoice`, before the `atomic()` block.
+- `InvoicesPay` still does its own `Invoice.objects.get(id=pk, tenant=tenant)`
+  before calling `pay_invoice`, which repeats the service's lookup and makes
+  `except services.InvoiceNotFound` unreachable. Harmless (both scope by tenant)
+  but it is duplicated logic in two files.
+- `LedgerEntry.description` is still never set — both invoicing and payment write
+  `''`. Now that there are two kinds of pair in the table, a readable line
+  (`"payment for invoice 42"` vs the billing window) is worth more than it was.
 
 Validation layering (settled during the negative-money work, applies to every
 model from here on):
@@ -1422,7 +1731,10 @@ none. The zero-length-period work adds exactly one file, migration
 `0007_subscription_prevent_zero_length_period.py`, taking the count to **30**.
 Confirmed at **30** on 2026-08-08. The `__str__` and ordering work touched
 `models.py` and `views.py` only and generated no migration, so the count is
-unchanged by it.
+unchanged by it. Still **30** on 2026-08-09 — the Phase 3 payment work touched
+`services.py`, `views.py`, `serializers.py` and `urls.py` and added no file. The
+`Idempotency-Key` step will not add one either; `IdempotencyKey` has existed
+since `0001_initial`.
 
 `requirements.txt` gained `python-dateutil==2.9.0.post0` and its `six==1.17.0`
 dependency in `ff871e1`, for `relativedelta` in the period advance. A

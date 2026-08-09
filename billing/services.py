@@ -18,6 +18,18 @@ class InvoiceAlreadyExists(BillingError):
 class PeriodNotEnded(BillingError):
     pass
 
+class InvoiceNotFound(BillingError):
+    pass
+
+class InvoiceAlreadyPaid(BillingError):
+    pass
+
+class AmountMismatch(BillingError):
+    pass
+
+class PaymentDeclined(BillingError):
+    pass
+
 
 def generate_invoice(tenant):
     
@@ -92,3 +104,32 @@ def mock_payment_gateway(amount, currency, reference):
             'currency': currency,
             'reference': reference
             }
+
+
+def pay_invoice(tenant, invoice_id, amount):
+    try:
+        invoice = Invoice.objects.get(tenant = tenant, id = invoice_id)
+    except Invoice.DoesNotExist:
+        raise InvoiceNotFound('invoice not found')
+
+    if invoice.status != 'OPEN':
+        raise InvoiceAlreadyPaid('invoice already paid')
+
+    if invoice.amount != amount:
+        raise AmountMismatch('amount mismatch')
+
+    transaction_id = uuid.uuid4()
+    
+    gateway_res = mock_payment_gateway(amount, invoice.currency, invoice_id)
+    if gateway_res['status'] == "declined":
+        raise PaymentDeclined('payment declined')
+    
+
+    with transaction.atomic():
+        invoice.status = 'PAID'
+        invoice.paid_at = timezone.now()
+        invoice.save()
+        LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = transaction_id, account= 'ACCOUNTS_RECEIVABLE' ,amount = -amount, currency = invoice.currency)
+        LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = transaction_id, account= 'CASH' ,amount = amount, currency = invoice.currency)
+
+    return invoice
