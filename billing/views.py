@@ -123,8 +123,6 @@ class InvoicesPay(APIView):
             invoice_dict, invoice_dict_status = services.pay_invoice(tenant, invoice.id, amount, idempotency_key, request_hash)
         except services.InvoiceNotFound as e:
             raise exceptions.NoInvoiceToPay(e)
-        except services.InvoiceAlreadyPaid as e:
-            raise exceptions.InvoiceAlreadyPaid(e)
         except services.AmountMismatch as e:
             raise exceptions.AmountMissMatch(e)
         except services.RequestHashDiffers as e:

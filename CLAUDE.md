@@ -45,11 +45,21 @@ Before the commit: **`git add billing/exceptions.py`.** It is still untracked, s
 a fresh clone imports a module it does not have and nothing boots. Tracked count
 goes 30 → 31.
 
-Left open in Phase 3, not blocking the commit: the **orphaned `PROCESSING`
-rows**. Six of them exist right now. Any `raise` after the claim commits strands
-a key that then answers 409 "already processing" forever — still reachable via
-the `status != 'OPEN'` check. Decide before Phase 5 writes a test against that
-arm; see "Orphaned `PROCESSING` rows" below.
+Left open in Phase 3, not blocking the commit, and all three are the same
+question about key lifetime — decide them together:
+
+- **Orphaned `PROCESSING` rows — narrowed 2026-08-10, not closed.** The
+  `status != 'OPEN'` path now stores a `409` instead of raising, so only a
+  genuine crash between the claim and the stamp can strand a key. `PROCESSING`
+  therefore has one meaning now, which is what makes an age-based rule usable.
+- **A decline burns the key.** A retry after a decline replays `402` forever, so
+  a customer who fixes their card can never pay that invoice with the same key.
+  Correct as designed, but it needs the "one key per attempt" line in the Phase 6
+  README, and a **5-minute TTL on `COMPLETED 402` keys** is agreed and unbuilt.
+- **`COMPLETED 200` keys never expire.** Real gateways age keys out at 24h.
+
+See "A decline burns the key" and "Orphaned `PROCESSING` rows" below for the
+shapes and the race that the TTL has to avoid.
 
 Still the oldest unstarted Phase 2 item, untouched for a fourth session:
 narrowing the bare `except IntegrityError` in
@@ -1736,18 +1746,177 @@ One process note that did work: every fix was verified by curling the running
 stack and reading the DB rows back, not by reading the diff. Three of the seven
 items above looked correct in the editor.
 
-### Orphaned `PROCESSING` rows — open, not designed
+- **A `SyntaxError` at import kills `runserver` and the container still reports
+  healthy.** An indentation slip gave
+  `File "/app/billing/services.py", line 147 / SyntaxError: 'return' outside
+  function`, the reloader child died, and it **did not come back when the file
+  was fixed**. Every curl returned `HTTP 000` (connection refused) while
+  `docker compose ps` still said `Up 2 hours` and the port was still published.
+  `000` plus a healthy-looking `ps` means **`docker compose restart web`**, not a
+  bad request. Sibling of the stale-`COPY` and stale-bytecode traps already in
+  this file: the container being up is not the same as the app being up.
 
-Any exception raised *after* the claim commits leaves a row stuck at
-`PROCESSING` forever: the status check, the amount check when it moves, and
-(until 5b lands) the decline. Four such rows accumulated this session
-(`demo-key-002`, `fresh-001`, `fresh-002`, and others).
+### A decline burns the key — the client contract, and a 5-minute TTL
 
-That matters because the `PROCESSING` arm answers **409 "still in flight"**, which
-is a lie for a request that will never finish — the key is permanently unusable
-and the client cannot tell why. Two plausible fixes, neither chosen: clean up the
-row on those raise paths, or treat `PROCESSING` older than N seconds as stale.
-Decide before Phase 5 writes a test against that arm.
+**Current behaviour, verified live:** a retry carrying the same key as a declined
+payment replays the stored `402` forever. The gateway is never called again, the
+invoice stays `OPEN`, and no ledger row is ever written. `demo-dec-86` twice:
+both `402`, identical body, `ledger rows 0`.
+
+That is correct and it is what real gateways do, but it has a sharp edge. A
+customer declined for `insufficient_funds` who tops up and presses Pay again
+gets the stored `402` back and **can never pay that invoice** if the client
+reused the key. The invoice then sits `OPEN`, goes `PAST_DUE` at 7 days and
+`CANCELED` after (decision 8) — for a customer who was trying to pay.
+
+**The contract is one key per *attempt*, not per invoice.** Reusing a key is
+only correct when the client does not know whether the first request landed: a
+timeout, a dropped connection, a double-clicked button. A retry after a decline
+is a new attempt and needs a new key. This has to be stated in the Phase 6
+README, because nothing in the API can enforce it and the failure is silent.
+
+Why not just re-attempt the card on a replayed decline: a client retrying on a
+300ms timeout after a *successful* charge would then hit the gateway twice —
+the original double-charge wearing a different hat. Secondary reason, real in
+production: repeatedly re-attempting a declined card gets a merchant flagged by
+the issuer, and card networks fine retry storms.
+
+**Agreed, not built: expire a `COMPLETED` key whose `response_status` is `402`
+after 5 minutes.** Scoped deliberately narrow — only declines, only 5 minutes.
+It is safe in a way a general TTL is not: the first attempt moved **no money**,
+so letting the key re-attempt cannot double-charge. A TTL on a `COMPLETED 200`
+key would be exactly the opposite and must not be added by symmetry.
+
+Shape, when it is built:
+
+- In the collision branch, before the `state == 'COMPLETED'` replay, test
+  "declined **and** older than 5 minutes". If so, re-attempt; otherwise replay.
+- **Do not delete the row and re-`INSERT`.** Flip the existing row back to
+  `PROCESSING` with a conditional update and check the row count:
+  `IdempotencyKey.objects.filter(id=..., state='COMPLETED').update(state='PROCESSING')`
+  returns `1` for the winner and `0` for everyone else. Two concurrent retries
+  arriving after expiry would otherwise both read `COMPLETED`-and-stale and both
+  call the gateway — the check-then-write bug again, in the one branch that
+  exists to prevent it. Let the `UPDATE` decide, same reasoning as the claim
+  `INSERT` itself.
+- The loser of that race gets the `PROCESSING` 409, which is honest — someone
+  really is in flight.
+- **`created_at` is `auto_now_add`, so it is the claim time, not the completion
+  time.** For a decline the two are milliseconds apart so it is usable, but a
+  `completed_at` column would be the honest field and would also serve the
+  stale-`PROCESSING` question below. Worth adding both at once.
+
+Open and undecided: whether 5 minutes is right. It is short enough that a
+timeout retry (seconds) still replays, but topping up a card can take less than
+5 minutes, so a customer can still land inside the window and be told `402` for
+a card that now works. Shorter is friendlier and weaker; longer is safer and
+more annoying. Do not tune this before Phase 5 can test it.
+
+Note also that `COMPLETED 200` keys currently **never** expire — the row lives
+forever. Real gateways age keys out at 24h. Not wrong here, and it is the same
+family of question as the stale-`PROCESSING` rows below; decide all three
+together rather than one at a time.
+
+### Where a check goes relative to the claim — the rule
+
+Settled 2026-08-10, after trying to move the status check and watching it break
+the feature. Three checks now sit in three deliberate places, and the rule that
+puts them there is worth more than the individual placements:
+
+- **Client-fixable errors go *above* the claim.** `amount mismatch` is the case.
+  Nothing has happened, the client corrects the body and resends **with the same
+  key**, so the key must not be burned.
+- **Terminal server-state answers go *below* the claim and are *stored*, not
+  raised.** `payment declined` and `invoice already paid`. The answer will not
+  change on a retry, so it is a receipt rather than an error.
+- **Crashes are covered by neither.** That is the staleness rule's only remaining
+  job.
+
+Why the status check cannot move above the claim, which is the non-obvious half.
+**A retry always arrives at a `PAID` invoice** — request 1 paid it; that is what
+a retry is. Proved live on invoice `89`:
+
+```
+STEP 1   invoice 89 status: OPEN
+STEP 2   request 1, key r1   -> 200, the receipt
+STEP 3   invoice 89 status: PAID
+STEP 4   retry,     key r1   -> 200, the stored receipt
+```
+
+With `if invoice.status != 'OPEN': raise` above the claim, STEP 4 raises 409 and
+never reaches the collision branch — the `COMPLETED` arm becomes unreachable code
+and "same request twice returns the same result" becomes `200` then `409`.
+
+The reason underneath: **`invoice.status == 'PAID'` is ambiguous.** It means
+either "someone else paid this, you are too late" (409 is right) or "**this very
+key** paid it and your connection dropped" (replay is right). The invoice row
+cannot tell those apart; the idempotency row can. So the key must be consulted
+first, and the status check must sit after it.
+
+The trade, before and after storing the 409:
+
+| Order | Retry of a successful payment | New key at a paid invoice |
+|---|---|---|
+| check **above** claim | 409 — feature dead | 409, no orphan |
+| check **below**, 409 **raised** | 200, stored receipt | 409 + orphan row |
+| check **below**, 409 **stored** (current) | 200, stored receipt | 409 stored and replayable, no orphan |
+
+**Verified live 2026-08-10**, one invoice, two keys:
+
+```
+k1 #1  200  {"id":90,...,"status":"PAID"}
+k2 #1  409  {"detail":"invoice already paid"}
+k2 #2  409  same body          <- was "payment is already processing" before
+k1 #2  200  same receipt
+
+invoice 90: PAID | ledger rows 2
+  k1 | COMPLETED | 200 | {...invoice...}
+  k2 | COMPLETED | 409 | {'detail': 'invoice already paid'}
+```
+
+Note `k2`'s old behaviour was itself a replayability bug: attempt 1 answered
+"invoice already paid" and every attempt after answered "payment is already
+processing" — same key, same request, two different bodies.
+
+How a client legitimately reaches the 409 at all: by paying with a **different
+key**. A double-click where the client mints a key per click, two tabs, two
+devices, or a client that lost its key. The constraint only fuses requests
+carrying the *same* key — that limit is recorded in the session-1 section.
+
+Rejected: answering `200` to the second key because the invoice is settled
+anyway. It hands back a receipt for a charge that never happened on that
+request, and hides the fact that two keys raced for one invoice.
+
+`InvoiceAlreadyPaid` was deleted from `services.py`, `exceptions.py` and the
+view's `except` chain as part of this, exactly like `PaymentDeclined`.
+
+### Orphaned `PROCESSING` rows — narrowed, not closed
+
+Originally: any exception raised *after* the claim commits left a row stuck at
+`PROCESSING` forever — the decline (until 5b), and the status check (until the
+409 was stored). Both of those are now terminal, stored answers.
+
+**What remains is only the genuine crash**: process killed, connection dropped,
+or an unhandled 500 between the claim `INSERT` and the stamp. No reordering
+touches that class, which is why the two fixes were never really alternatives —
+cleaning up on known raise paths covers no crash at all.
+
+The upside of narrowing it: **`PROCESSING` now has a single meaning** — in
+flight, or died mid-flight. Before, it was polluted by rows that were never in
+flight for a second, so no rule could distinguish them. Now age is a usable
+signal, because a payment does not take 30 seconds.
+
+Still undecided, and it is the same question as the decline TTL: what the
+threshold is, whether a stale row is taken over or deleted, and whether the
+takeover uses the conditional-`UPDATE` guard described under "A decline burns
+the key". `created_at` is `auto_now_add` and is the *claim* time, which is the
+right clock for this one. Decide before Phase 5 writes a test against the 409
+`PROCESSING` arm.
+
+Do **not** "fix" this by deleting the claim row before raising. It opens a race:
+a concurrent request that already hit `IntegrityError` then runs
+`IdempotencyKey.objects.get(...)` and finds nothing — `DoesNotExist`, 500.
+Storing the answer has no such window.
 
 ## Phase 7 — horizontal scale (added 2026-08-09, nothing built)
 

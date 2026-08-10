@@ -21,9 +21,6 @@ class PeriodNotEnded(BillingError):
 class InvoiceNotFound(BillingError):
     pass
 
-class InvoiceAlreadyPaid(BillingError):
-    pass
-
 class AmountMismatch(BillingError):
     pass
 
@@ -138,7 +135,13 @@ def pay_invoice(tenant, invoice_id, amount, idempotency_key, request_hash):
 
 
     if invoice.status != 'OPEN':
-        raise InvoiceAlreadyPaid('invoice already paid')
+        body = {'detail': 'invoice already paid'}
+        idem_key_object.response_body = body
+        idem_key_object.response_status = 409
+        idem_key_object.state = 'COMPLETED'
+        idem_key_object.save()
+        idem_key_object.refresh_from_db()
+        return idem_key_object.response_body, 409
 
     
     transaction_id = uuid.uuid4()

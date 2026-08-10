@@ -32,12 +32,6 @@ class NoInvoiceToPay(APIException):
     default_code = 'no_invoice_to_pay'
 
 
-class InvoiceAlreadyPaid(APIException):
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = 'invoice already paid'
-    default_code = 'invoice_already_paid'
-
-
 class AmountMissMatch(APIException):
     status_code = status.HTTP_400_BAD_REQUEST
     default_detail = 'invoice amount does not match the amount passed'
