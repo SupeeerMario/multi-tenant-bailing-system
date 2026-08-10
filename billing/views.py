@@ -1,61 +1,15 @@
 from rest_framework import permissions, generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from . import serializers, models, services
+from . import serializers, models, services, exceptions
 from django.db import IntegrityError
-from rest_framework.exceptions import APIException
 from django.utils import timezone
 from dateutil.relativedelta import relativedelta
-from decimal import Decimal
+import hashlib, json
 
 # Create your views here.
 
-class SubscriptionAlreadyExists(APIException):
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = "Conflict. This tenant already has an active subscription"
-    default_code = "subscription_exists"
 
-
-class NoActiveSubscription(APIException):
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = 'No active subscription found for the current tenant'
-    default_code = 'subscription_not_found'
-
-
-class PeriodNotEnded(APIException):
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = 'Cannot make a bill while the period has not ended'
-    default_code = 'period_has_not_ended'
-
-
-
-class InvoiceAlreadyExists(APIException):
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = 'Invoice already billed for the current tenant'
-    default_code = 'invoice_already_billed'
-
-
-class NoInvoiceToPay(APIException):
-    status_code = status.HTTP_404_NOT_FOUND
-    default_detail = 'no invoice to pay'
-    default_code = 'no_invoice_to_pay'
-
-
-class InvoiceAlreadyPaid(APIException):
-    status_code = status.HTTP_409_CONFLICT
-    default_detail = 'invoice already paid'
-    default_code = 'invoice_already_paid'
-
-
-class AmountMissMatch(APIException):
-    status_code = status.HTTP_400_BAD_REQUEST
-    default_detail = 'invoice amount does not match the amount passed'
-    default_code = 'amount_missmatch'
-
-class PaymentDeclined(APIException):
-    status_code = status.HTTP_402_PAYMENT_REQUIRED
-    default_detail = 'payment declined'
-    default_code = 'payment_declined'
 
 class TenantCreateView(generics.CreateAPIView):
     permission_classes = [permissions.AllowAny]
@@ -84,7 +38,7 @@ class SubscriptionsCreateView(generics.CreateAPIView):
             serializer.save(tenant = tenant, current_period_end = period_end)
 
         except IntegrityError:
-            raise SubscriptionAlreadyExists()
+            raise exceptions.SubscriptionAlreadyExists()
 
 
 class UsageEventListCreateView(generics.ListCreateAPIView):
@@ -97,7 +51,7 @@ class UsageEventListCreateView(generics.ListCreateAPIView):
         try:
             sub = models.Subscription.objects.get(tenant = tenant, status = 'ACTIVE')
         except models.Subscription.DoesNotExist:
-            raise NoActiveSubscription()
+            raise exceptions.NoActiveSubscription()
 
         serializer.save(subscription = sub)
 
@@ -116,18 +70,18 @@ class InvoiceAPIView(APIView):
         try:
             sub = models.Subscription.objects.get(tenant = self.request.tenant, status = 'ACTIVE')
         except models.Subscription.DoesNotExist:
-            raise NoActiveSubscription()
+            raise exceptions.NoActiveSubscription()
 
         
         if sub.current_period_end > timezone.now():
-            raise PeriodNotEnded(f"Cannot make a bill for {sub.current_period_end} as the period has not ended")
+            raise exceptions.PeriodNotEnded(f"Cannot make a bill for {sub.current_period_end} as the period has not ended")
 
         try:
             invoice = services.generate_invoice(request.tenant)
         except services.InvoiceAlreadyExists as e:
-            raise InvoiceAlreadyExists(e)
+            raise exceptions.InvoiceAlreadyExists(e)
         except services.NoActiveSubscription as e:
-            raise NoActiveSubscription(e)
+            raise exceptions.NoActiveSubscription(e)
 
         
         invoice_data = serializers.InvoiceSerializer(invoice).data
@@ -141,10 +95,20 @@ class InvoicesPay(APIView):
     def post(self, request, pk):
         tenant = self.request.tenant
 
+        idempotency_key = request.headers.get('Idempotency-Key')
+
+        if not idempotency_key:
+            raise exceptions.IdempotencyKeyMissing
+        if len(idempotency_key) > 512:
+            raise exceptions.IdempotencyKeyTooLong
+
+        request_hash = hashlib.sha256(json.dumps({"invoice": pk, **self.request.data}, sort_keys = True).encode()).hexdigest()
+
+
         try:
             invoice = models.Invoice.objects.get(id = pk, tenant = tenant)
         except models.Invoice.DoesNotExist:
-            raise NoInvoiceToPay
+            raise exceptions.NoInvoiceToPay
 
 
 
@@ -156,18 +120,18 @@ class InvoicesPay(APIView):
 
 
         try:
-            pay = services.pay_invoice(tenant, invoice.id, amount)
+            invoice_dict, invoice_dict_status = services.pay_invoice(tenant, invoice.id, amount, idempotency_key, request_hash)
         except services.InvoiceNotFound as e:
-            raise NoInvoiceToPay(e)
+            raise exceptions.NoInvoiceToPay(e)
         except services.InvoiceAlreadyPaid as e:
-            raise InvoiceAlreadyPaid(e)
+            raise exceptions.InvoiceAlreadyPaid(e)
         except services.AmountMismatch as e:
-            raise AmountMissMatch(e)
-        except services.PaymentDeclined as e:
-            raise PaymentDeclined(e)
+            raise exceptions.AmountMissMatch(e)
+        except services.RequestHashDiffers as e:
+            raise exceptions.RequestHashDiffers(e)
+        except services.PaymentAlreadyProcessing as e:
+            raise exceptions.PaymentAlreadyProcessing(e)
 
-        invoice_data = serializers.InvoiceSerializer(pay).data
 
-
-        return Response(invoice_data, status=status.HTTP_200_OK)
+        return Response(invoice_dict, status= invoice_dict_status)
     

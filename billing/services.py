@@ -1,4 +1,4 @@
-from .models import Subscription, UsageEvent, Invoice, LedgerEntry
+from .models import Subscription, UsageEvent, Invoice, LedgerEntry, IdempotencyKey
 from django.db.models import Sum
 from decimal import Decimal, ROUND_HALF_UP
 from django.db import IntegrityError, transaction
@@ -27,8 +27,14 @@ class InvoiceAlreadyPaid(BillingError):
 class AmountMismatch(BillingError):
     pass
 
-class PaymentDeclined(BillingError):
+class PaymentAlreadyProcessing(BillingError):
     pass
+
+class RequestHashDiffers(BillingError):
+    pass
+
+
+
 
 
 def generate_invoice(tenant):
@@ -106,30 +112,90 @@ def mock_payment_gateway(amount, currency, reference):
             }
 
 
-def pay_invoice(tenant, invoice_id, amount):
+def pay_invoice(tenant, invoice_id, amount, idempotency_key, request_hash):
     try:
         invoice = Invoice.objects.get(tenant = tenant, id = invoice_id)
     except Invoice.DoesNotExist:
         raise InvoiceNotFound('invoice not found')
 
-    if invoice.status != 'OPEN':
-        raise InvoiceAlreadyPaid('invoice already paid')
-
     if invoice.amount != amount:
         raise AmountMismatch('amount mismatch')
 
+
+    try:
+        idem_key_object = IdempotencyKey.objects.create(tenant = tenant, key = idempotency_key, request_hash = request_hash, state = 'PROCESSING')
+    except IntegrityError:
+        exist = IdempotencyKey.objects.get(tenant = tenant, key = idempotency_key)
+
+        if exist.request_hash != request_hash:
+            raise RequestHashDiffers('request hash differs')
+
+        if exist.state == "PROCESSING":
+            raise PaymentAlreadyProcessing('payment is already processing')
+
+        if exist.state == 'COMPLETED':
+            return exist.response_body, exist.response_status
+
+
+    if invoice.status != 'OPEN':
+        raise InvoiceAlreadyPaid('invoice already paid')
+
+    
     transaction_id = uuid.uuid4()
     
     gateway_res = mock_payment_gateway(amount, invoice.currency, invoice_id)
+
     if gateway_res['status'] == "declined":
-        raise PaymentDeclined('payment declined')
-    
+
+        body = {
+            'detail': 'payment declined', 
+            'code': gateway_res['code']
+            }
+
+        idem_key_object.response_body = body 
+        idem_key_object.response_status = 402
+        idem_key_object.state = 'COMPLETED'
+        idem_key_object.save()
+        idem_key_object.refresh_from_db()
+        return idem_key_object.response_body, 402
+
+
 
     with transaction.atomic():
         invoice.status = 'PAID'
         invoice.paid_at = timezone.now()
         invoice.save()
-        LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = transaction_id, account= 'ACCOUNTS_RECEIVABLE' ,amount = -amount, currency = invoice.currency)
-        LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = transaction_id, account= 'CASH' ,amount = amount, currency = invoice.currency)
+        LedgerEntry.objects.create(tenant = tenant, 
+                                   invoice = invoice, 
+                                   transaction_id = transaction_id, 
+                                   account= 'ACCOUNTS_RECEIVABLE',
+                                   amount = -amount, 
+                                   currency = invoice.currency
+                                   )
+        
+        LedgerEntry.objects.create(tenant = tenant, 
+                                   invoice = invoice, 
+                                   transaction_id = transaction_id, 
+                                   account = 'CASH', 
+                                   amount = amount, 
+                                   currency = invoice.currency
+                                   )
 
-    return invoice
+        invoice_dict = {'id' : invoice.id,
+                        'tenant': invoice.tenant_id, 
+                        'amount': str(invoice.amount), 
+                        'status': invoice.status, 
+                        'period_start': invoice.period_start.isoformat(), 
+                        'period_end': invoice.period_end.isoformat(), 
+                        'currency': invoice.currency, 
+                        'created_at': invoice.created_at.isoformat(), 
+                        'paid_at': invoice.paid_at.isoformat()
+                        }
+
+        idem_key_object.response_body = invoice_dict
+        idem_key_object.response_status = 200
+        idem_key_object.state = 'COMPLETED'
+        idem_key_object.save()
+        idem_key_object.refresh_from_db()
+
+    return idem_key_object.response_body, 200

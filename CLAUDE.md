@@ -11,26 +11,49 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Updated 2026-08-09, end of the first Phase 3 session. **Phase 3 is started and
-roughly half built** — the mock gateway, `pay_invoice`, and the pay endpoint all
-work end to end. What is missing is the actual hero feature: the
-`Idempotency-Key` claim. See "Phase 3 — where it stands" for the full picture.
+Updated 2026-08-10, end of the third Phase 3 session. **Phase 3 is code-complete
+and its "Done when" is met.** Step 5b landed: `pay_invoice` returns
+`(body, status)` on every path, a decline is stored and replayed instead of
+raised, and both paths return `idem_key_object.response_body` after
+`refresh_from_db()` so a replay is byte-identical to the original. The two-curl
+proof is captured and pasted into this file — see "The two-curl proof" under
+"Phase 3 — the claim, session 2".
 
-**Next action: claim the key.** The design is settled and written down; the step
-order is in the Phase 3 section under "The claim, and why the order is the whole
-point". Nothing is blocking it.
+**Next action: commit.** Nothing in the code is known-broken and the dev
+database is back on baseline.
 
-The current pay path **double-charges under concurrency** — proved live this
-session, two simultaneous calls both charging a `30.00` invoice for a `CASH`
-total of `60.00`, with the ledger still summing to `0.00`. That output is Phase
-3 deliverable material; keep it.
+**Dev database cleaned 2026-08-10, verified.** Throwaway tenant `40 KeyTest` and
+its whole tree deleted in `PROTECT` order — 14 ledger rows, 10 invoices
+(`78`–`87`, including the corrupt `81` written by a declined payment before 5b
+landed), 15 `IdempotencyKey` rows, subscription `75`, then the tenant. A
+pre-delete check confirmed no row outside tenant `40` referenced a tenant-`40`
+invoice, so nothing else could be dragged along.
 
-Dev database is on baseline (`4 tenants / 1 plan / 5 subscriptions / 6 usage
-events / 4 invoices / 8 ledger rows`, ledger sum `0.00`). Two throwaway tenants
-(`38 PayTest`, `39 RaceTest`) were created and fully deleted this session.
+Baseline re-read after the delete and it matches exactly:
+**`4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices / 8 ledger
+rows`**, ledger sum `0.00`, `0` idempotency keys. Invoices are `17` (`30.00`),
+`18` (`39.44`), `19` (`20.00`) for Acme and `20` (`36.67`) for Globex, all still
+`OPEN` — none of the demo payments touched real seed data, deliberately, because
+paying one would permanently change the numbers this file quotes.
 
-Still the oldest unstarted Phase 2 item, untouched for a third session: narrowing
-the bare `except IntegrityError` in `SubscriptionsCreateView.perform_create`.
+The stronger invariant also passes per tenant — `sum(ACCOUNTS_RECEIVABLE)`
+equals the tenant's outstanding `OPEN` invoices: Acme `89.44`, Globex `36.67`,
+Initech and `test name` `0`. That is the check that catches the bugs sum-to-zero
+misses.
+
+Before the commit: **`git add billing/exceptions.py`.** It is still untracked, so
+a fresh clone imports a module it does not have and nothing boots. Tracked count
+goes 30 → 31.
+
+Left open in Phase 3, not blocking the commit: the **orphaned `PROCESSING`
+rows**. Six of them exist right now. Any `raise` after the claim commits strands
+a key that then answers 409 "already processing" forever — still reachable via
+the `status != 'OPEN'` check. Decide before Phase 5 writes a test against that
+arm; see "Orphaned `PROCESSING` rows" below.
+
+Still the oldest unstarted Phase 2 item, untouched for a fourth session:
+narrowing the bare `except IntegrityError` in
+`SubscriptionsCreateView.perform_create`.
 
 ## Phase gating — read this first
 
@@ -44,10 +67,11 @@ remaining item rather than going along with it.
 |---|---|---|
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
 | 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
-| 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **In progress** (2026-08-09) — gateway, `pay_invoice`, and `POST billing/invoices/<pk>/pay/` done and verified. `Idempotency-Key` not started, so the "Done when" is **not** met: a retry currently returns 409 rather than the original response, and concurrent calls double-charge |
-| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | Blocked on 3 |
+| 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" below. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
+| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **Unblocked** (2026-08-10) — not started |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
 | 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
+| 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | Blocked on 6 (2026-08-09) |
 
 ### Phase 1 — what was verified
 
@@ -1041,6 +1065,13 @@ Built and verified: `mock_payment_gateway` (`e5dd899`), then `pay_invoice`,
 `InvoicesPay`, `PaymentSerializer` and the URL rename. Not built: the
 `Idempotency-Key` claim, which is the whole point of the phase.
 
+**Superseded 2026-08-10** — the claim was built the following session. Everything
+below this line describes the state *before* it and is kept for the reasoning
+(why a DB constraint rather than an `if`, why the pk is in the URL, the
+double-charge repro that is the deliverable's "before"). For what the code
+actually does now, read "Phase 3 — the claim, session 2" further down; where the
+two disagree, session 2 wins.
+
 | Route | View | Permission | Body |
 |---|---|---|---|
 | `POST billing/invoices/generate/` | `InvoiceAPIView` | `IsAuthenticated` | none |
@@ -1263,6 +1294,567 @@ refund's reversing pair, so it is a real tradeoff and not Phase 3 work.
   load-bearing, and the `services.` prefix is mandatory now that
   `InvoiceAlreadyPaid` exists in both files — a bare `except InvoiceAlreadyPaid:`
   binds the view's own class, which the service never raises.
+
+## Phase 3 — the claim, session 2 (2026-08-10, uncommitted)
+
+Built in five steps, each verified live against the running stack before the
+next started. Steps 1 through 5a landed in session 2; **5b landed in session 3
+on 2026-08-10** and all five steps now work. The "5b, what is wrong right now"
+list below is kept as a record of what was broken and how each failure
+presented — every item on it is fixed.
+
+### What landed
+
+**Step 1 — the header.** `InvoicesPay.post()` reads
+`request.headers.get('Idempotency-Key')` at the top, before the invoice lookup.
+Falsy → `IdempotencyKeyMissing` (400). Length > 512 → `IdempotencyKeyTooLong`
+(400), matching `IdempotencyKey.key`'s `max_length`.
+
+`request.headers` is case-insensitive and returns **str**, not bytes — the
+opposite of `get_authorization_header()` in the auth layer, which needed
+`.decode()`. Guarding on falsy is right here because `''` (from a header sent
+with no value) is genuinely invalid; note this is the opposite call from
+`Decimal('0')`, where falsy is a legal value. The rule is not "never use
+truthiness", it is "decide whether falsy is legal for this type".
+
+A `len(key) < 10` floor was written first and removed: the server never parses
+this string, only compares it, so it has no standing to demand a format.
+`Idempotency-Key: banana` is a valid key and returns the same result as a uuid.
+
+**Step 2 — `request_hash`.**
+
+```python
+request_hash = hashlib.sha256(
+    json.dumps({"invoice": pk, **self.request.data}, sort_keys=True).encode()
+).hexdigest()
+```
+
+Verified all three required properties live:
+
+| Input | Digest |
+|---|---|
+| `{'invoice': 17, 'amount': '30.00'}` | `8bb8c9ae…` |
+| same, recomputed | `8bb8c9ae…` — deterministic |
+| `{'note':'x','amount':'30.00'}` vs same keys reordered | identical — `sort_keys` works |
+| `{'invoice': 19, 'amount': '20.00'}` vs `{'invoice': 43, 'amount': '20.00'}` | different — the `base_fee` collision decision 7 exists to kill |
+
+**Step 3 — the claim.** `pay_invoice` gained `idempotency_key` and
+`request_hash` parameters, `IdempotencyKey` was added to the `services.py` model
+import, and the `create(..., state='PROCESSING')` sits **above** the gateway
+call and **outside** the `atomic()` block. First run behaved exactly as intended:
+first payment 200, second with the same key a 500 carrying
+
+```
+IntegrityError: duplicate key value violates unique constraint "unique_key_per_tenant"
+DETAIL:  Key (tenant_id, key)=(40, demo-key-001) already exists.
+```
+
+and **two** ledger rows on that invoice, not four. The double-charge is dead for
+the same-key case.
+
+**Step 4 — the branch.** `try/except IntegrityError` around the claim, and
+inside the `except`, read the row back with `get(tenant=..., key=...)` and
+decide:
+
+| Existing row | Answer | Verified |
+|---|---|---|
+| `request_hash` differs | `RequestHashDiffers` → 422 | yes |
+| `state='PROCESSING'` | `PaymentAlreadyProcessing` → 409 | yes |
+| `state='COMPLETED'` | return the stored body | yes (5a/5b) |
+
+Hash check goes first: a mismatched hash is a client bug whatever state the row
+is in, and answering "still processing" to a wrong payload misleads.
+
+**Step 5a — build the body, stamp the row.** The `create()` return value is now
+bound (`idem_key_object`). Inside the existing `atomic()` block, after the
+ledger pair, a hand-built `invoice_dict` mirroring `InvoiceSerializer`'s nine
+fields is assigned to `response_body`, with `response_status` and
+`state='COMPLETED'`, then saved. Verified live on invoice `80`:
+
+```
+state: COMPLETED | response_status: 200
+body: {"id": 80, "amount": "30.00", "status": "PAID", "tenant": 40, ...}
+inv80: PAID | ledger rows: 2
+```
+
+### `exceptions.py` — the API exceptions moved out (this session)
+
+New file `billing/exceptions.py` holds all ten `APIException` subclasses;
+`views.py` imports it and every raise site is now `exceptions.X`. `views.py` was
+196 lines with over half the top being exception declarations.
+
+**The `BillingError` tree deliberately stayed in `services.py`.** One file
+holding both would mean `services.py` imports a module that imports
+`rest_framework` at module level — decision 2 broken through the back door, and
+invisibly, since nothing fails until the Phase 4 worker runs somewhere DRF is
+not configured. The check that the split held:
+
+```bash
+grep -c "rest_framework" billing/services.py     # must be 0
+```
+
+It is 0. Import direction is one-way: `views.py` imports both trees,
+`services.py` imports only its own.
+
+The `services.` prefix on every `except` clause is still mandatory — moving the
+API classes to another module does not fix the shadowing, since
+`InvoiceAlreadyPaid` still exists in both trees.
+
+Renamed while moving: `WrongIdempotencyKey` → `IdempotencyKeyTooLong`, because
+step 4's 422 ("same key, different hash") is the error a reader would actually
+call a wrong key. Naming the length check that first would have produced two
+plausibly-named classes and the same failure mode as the duplicate
+`NoActiveSubscription`.
+
+Parked, not done: 7 service errors each with a hand-written HTTP twin is 14
+classes to say 7 things. A dict at the boundary (`{services.AmountMismatch: 400,
+…}`) collapses it, at the cost of grep-ability. Not while the hero feature is
+half-built.
+
+### 5b — what was wrong (all fixed 2026-08-10)
+
+**Every item below is closed.** Kept because each one failed in a different way
+and none of them failed loudly; the list is more useful as a catalogue of how
+these break than as a to-do.
+
+The intent: `pay_invoice` returns a `(body, status)` pair on **every** path, the
+view unpacks and builds the `Response`, and the decline stops being an exception
+and becomes a stored, replayable answer. Note the final order is
+`(body, status)`, not the `(response_status, response_body)` written when this
+was planned — the view's names settled it.
+
+What was in the file:
+
+1. **The decline does not `return`.** An `if gateway_res['status'] ==
+   'succeeded': … else: …` picks a `body` dict and a number, then execution
+   continues into the `atomic()` block regardless. A declined payment marks the
+   invoice `PAID` and writes the `CASH`/`AR` pair. Live proof on invoice `81`
+   above. **Fix this first.** The branch must `return` and leave the function;
+   no `else` is needed, the success path is everything after it.
+2. **The `body` dict is never used as a body.** It is built, then `invoice_dict`
+   is stored and returned in both cases. `body` is read only for `body['code']`.
+3. **`'code'` holds an HTTP status (`200`/`402`).** Two different things merged.
+   The HTTP status belongs in the returned tuple; `gateway_res['code']` — the
+   gateway's reason string, e.g. `'insufficient_funds'` — belongs in the body.
+4. **The `COMPLETED` arm returns one value**, `exist.response_body`, while every
+   other path returns a tuple. Needs `return exist.response_status,
+   exist.response_body`. A dict is iterable, so a two-name unpack of a 9-key
+   dict fails on count rather than silently binding keys — but a 2-key body
+   would bind key *names* and look plausible.
+5. **`'detils'`** → `'detail'`, which is what DRF uses everywhere else in this
+   API.
+
+Plus in `views.py`: the unpack is backwards —
+`invoice_dict, invoice_dict_status = services.pay_invoice(...)` against a service
+returning `(code, dict)`. Names and return order must agree.
+
+Target shape:
+
+```
+gateway_res = mock_payment_gateway(...)
+
+if gateway_res['status'] == 'declined':
+    body = {'detail': 'payment declined', 'code': gateway_res['code']}
+    stamp row: COMPLETED, 402, body        # not in atomic() — no other writes
+    return 402, body
+
+with transaction.atomic():
+    invoice PAID, ledger pair, invoice_dict, stamp row COMPLETED/200
+return 200, invoice_dict
+```
+
+`PaymentDeclined` and `PaymentAlreadyPaid` both get deleted from `services.py`,
+`exceptions.py` and the view's `except` chain — both stop being errors. A stale
+`except services.PaymentDeclined` after the class is gone does **not** fail at
+import: Python evaluates that expression only when an exception propagates, so
+it sits quiet until some unrelated error hits and then masks it with an
+`AttributeError`.
+
+### Decisions made this session
+
+- **The claim goes below `amount mismatch`, above `status != 'OPEN'`.** They are
+  different kinds of check. A bad amount is client input and nothing has
+  happened, so it must not burn the key — the client can resend with the same
+  one. The status check is server state, and on a retry of a *successful*
+  payment it is `PAID` precisely because this key already paid it; leaving it
+  above the claim means the retry returns 409 and never reaches the stored
+  receipt, which is the exact behaviour Phase 3 exists to remove.
+- **Consequence, accepted:** with the amount check above the claim, a *different*
+  amount on the same key returns 400 before the hash is ever compared, so the
+  422 arm is reachable only through non-`amount` body drift or key reuse across
+  invoices. Both are real. Verified live: paying invoice `80` (also `30.00`) with
+  invoice `78`'s key returns 422 — amount is correct for `80`, only the `pk` in
+  the hash catches it. Without `pk` in the hash that request would have replayed
+  invoice `78`'s receipt while `80` stayed `OPEN`.
+- **Option A for the response body: hand-build the dict in `services.py`**,
+  rather than importing `InvoiceSerializer`. Keeps the DRF-free property
+  measurable at 0. Cost is a second list of invoice fields that can drift from
+  the serializer; comment it as mirroring `InvoiceSerializer`.
+- **The stamp lives inside the same `atomic()` block as the ledger pair.** Split
+  them and a crash between commit and stamp leaves a `PROCESSING` row on a `PAID`
+  invoice — every retry 409s forever. The claim `INSERT` stays outside; only the
+  `UPDATE` is inside.
+- **`(status, body)` tuple rather than a bare dict**, so `response_status` drives
+  the response instead of a hardcoded 200. Only justified once declines are
+  stored — hence doing the decline now rather than deferring it.
+- **Decline body is mapped, not forwarded.** `{'detail': 'payment declined',
+  'code': gateway_res['code']}` — the client sees this API's shape, not the
+  gateway's. Storing `gateway_res` verbatim was the simpler option and was
+  rejected: a real gateway returns issuer text and internal reason codes, and
+  forwarding them makes the API contract whatever the provider decides to put in
+  a string. Whatever is chosen, **store exactly what is returned** — if the
+  stored body and the fresh body differ, the replay proof fails by construction.
+
+### Traps hit, worth not re-learning
+
+- **`request.header` vs `request.headers`.** Django says it outright —
+  `AttributeError: 'WSGIRequest' object has no attribute 'header'. Did you mean:
+  'headers'?` — and it fires before the guard runs, so *every* request 500s,
+  valid ones included. Same family as `Meta.models` and `serializers.save`.
+- **`len(None)` is a `TypeError`.** `.get()` returns `None` when the header is
+  absent, so `if len(key) < 10` crashes on exactly the case it exists to catch.
+  Guard the value, not its length.
+- **`hashlib.sha256` takes bytes**: `TypeError: Strings must be encoded before
+  hashing`. `json.dumps` returns `str`; `.encode()` is the missing step.
+- **Without `.hexdigest()` the variable holds the hash object**, `<sha256
+  _hashlib.HASH object @ 0x…>` — a real object with a real repr, so nothing
+  raises until it is compared or stored. Same shape as bare `uuid.uuid4` passed
+  as a value and `.date` without parens.
+- **A `get()` *before* the `create()` is the check-then-write bug.** Two
+  concurrent requests both `SELECT` nothing and one still dies on the constraint,
+  so the `except` branch is needed regardless — and the pre-`get` makes the
+  sequential path look correct while the concurrent path stays untested. React to
+  the `IntegrityError`; do not try to predict it.
+- **The `get()` inside `except IntegrityError` only works in autocommit.** Inside
+  a `transaction.atomic()` block Postgres marks the transaction aborted and every
+  later query fails with `current transaction is aborted, commands ignored until
+  end of transaction block`. `ATOMIC_REQUESTS` is unset so this is currently
+  safe; do not wrap the claim in `atomic()` and do not enable `ATOMIC_REQUESTS`
+  without revisiting it.
+- **A branch that neither returns nor raises keeps going.** Hit twice in one
+  session. First: the `COMPLETED` arm was left empty, so a retry fell out of the
+  `except` block into the status check and the gateway — reproduced live on
+  invoice `79` (`OPEN` invoice, `COMPLETED` key), `HTTP 200`, `inv79: PAID`,
+  2 ledger rows, a second charge with no error anywhere. Second: the decline
+  branch, still live. **Every path out of the collision block must `return` or
+  `raise`.**
+- **`if invoice.paid_at == None: raise` fires on every payment.** An `OPEN`
+  invoice always has `paid_at = None` — that is what unpaid means. Written to
+  protect `paid_at.isoformat()`, which needs no protection because `paid_at` is
+  set four lines earlier inside the block. Made paying anything impossible.
+- **`JSONField` rejects model instances and datetimes.** `Object of type Tenant
+  is not JSON serializable` (from `'tenant': invoice.tenant`) and the same for
+  `datetime`. Needs `invoice.tenant_id` and `.isoformat()`. Third and fourth
+  appearance of the "only `str/int/float/bool/None/list/dict`" rule after the two
+  gateway-receipt hits. The check that counts is `json.dumps(body)` succeeding,
+  not the dict looking fine.
+- **`invoice.tenant.id` loads the whole `Tenant` row**; `invoice.tenant_id` is
+  the same integer already in memory. Same lesson as the `__str__` work.
+- **Copy-paste in the body dict is invisible.** `'period_start':
+  invoice.period_end.isoformat()` stores a plausible date in the wrong field and
+  no test currently looks at it.
+- **`status` is already the DRF module in `views.py`.** A local named `status`
+  from the tuple unpack shadows it and the next line becomes `'int' object has no
+  attribute 'HTTP_200_OK'`.
+- **Formatting differs between the two paths.** DRF renders datetimes as
+  `2026-08-09T21:02:32.642081Z`; `.isoformat()` gives
+  `2026-08-09T21:02:32.642081+00:00`. Same instant, different bytes. Harmless
+  once *both* paths return the hand-built dict, which is what 5b does — but it
+  means the endpoint's output format shifts from `Z` to `+00:00`.
+- **A crash after the gateway cannot be undone.** The `Tenant`-not-serializable
+  500 happened after `mock_payment_gateway` returned `succeeded`, so the
+  `atomic()` block rolled back and left no invoice update and no ledger rows —
+  while a real gateway would have taken the money. Not a code bug; it is the
+  reason the ledger writes are in one transaction, and the reason the claim is
+  committed before the gateway rather than after.
+
+### The two-curl proof — Phase 3's deliverable (captured 2026-08-10)
+
+Captured after 5b landed, against the running stack, on throwaway tenant `40`.
+This is the artifact the phase exists to produce; the Phase 6 README quotes it.
+Reproduce it after any change to `pay_invoice` — the curls are the test until
+Phase 5 writes a real one.
+
+```
+==============================================================
+ PHASE 3 PROOF — same payment request twice, charged once
+ captured 2026-08-10, tenant 40, invoice 85 (USD 30.00, OPEN)
+==============================================================
+
+--- ledger for invoice 85 BEFORE any request ---
+rows: 0
+
+$ curl -i -X POST http://localhost:8000/billing/invoices/85/pay/ \
+    -H 'Authorization: Api-Key <api-key>' \
+    -H 'Idempotency-Key: demo-pay-85' \
+    -H 'Content-Type: application/json' \
+    -d '{"amount": "30.00"}'
+
+--- REQUEST 1 ---
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Content-Type-Options: nosniff
+
+{"id":85,"amount":"30.00","status":"PAID","tenant":40,"paid_at":"2026-08-09T23:57:07.308490+00:00","currency":"USD","created_at":"2026-08-09T23:56:45.967324+00:00","period_end":"2026-09-19T23:56:45.966625+00:00","period_start":"2026-09-18T23:56:45.966625+00:00"}
+
+--- REQUEST 2 (identical, same Idempotency-Key) ---
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Content-Type-Options: nosniff
+
+{"id":85,"amount":"30.00","status":"PAID","tenant":40,"paid_at":"2026-08-09T23:57:07.308490+00:00","currency":"USD","created_at":"2026-08-09T23:56:45.967324+00:00","period_end":"2026-09-19T23:56:45.966625+00:00","period_start":"2026-09-18T23:56:45.966625+00:00"}
+
+--- ledger for invoice 85 AFTER both requests ---
+invoice status      : PAID
+invoice paid_at     : 2026-08-09 23:57:07.308490+00:00
+ledger rows         : 2
+distinct txn ids    : 1
+    ACCOUNTS_RECEIVABLE -30.00
+    CASH 30.00
+sum                 : 0.00
+idempotency state   : COMPLETED 200
+```
+
+The two bodies are **byte-identical**, confirmed by `diff` on a separate run of
+the same pair (invoice `84`, key `pay-live-002`) — empty output. That only holds
+because both paths return `idem_key_object.response_body` after
+`refresh_from_db()`; see "Byte-identical replay" below.
+
+The sharpest line in the block is `paid_at`, identical in both responses. A
+second charge would have stamped a new one. `ledger rows 2` with `distinct txn
+ids 1` is the other half: exactly one pair, so the money moved once. Compare
+against the two-thread repro in the session-1 section, which produced `ledger
+rows 4`, `distinct txn 2`, `CASH total 60.00` on the same `30.00` invoice — and
+still summed to `0.00`.
+
+**A decline is also stored and replayed**, invoice `86` (`66.66`, which the mock
+always declines):
+
+```
+--- REQUEST 1 ---                    --- REQUEST 2 (same key) ---
+HTTP/1.1 402 Payment Required        HTTP/1.1 402 Payment Required
+{"code":"insufficient_funds",        {"code":"insufficient_funds",
+ "detail":"payment declined"}         "detail":"payment declined"}
+
+invoice status      : OPEN
+invoice paid_at     : None
+ledger rows         : 0
+idempotency state   : COMPLETED 402
+stored body         : {'code': 'insufficient_funds', 'detail': 'payment declined'}
+```
+
+`OPEN` / `paid_at None` / **0 ledger rows** is the fix to the bug that opened
+this session — invoice `81` was marked `PAID` with a full `CASH` pair by a
+declined payment. The retry replays the stored decline rather than re-attempting
+the card.
+
+**Every other arm, run live the same day, output verbatim:**
+
+| Case | Response | Status |
+|---|---|---|
+| same key, different `request_hash` (key `demo-pay-85` reused on invoice `87`, amount still `30.00`) | `{"detail":"request hash differs"}` | 422 |
+| same key, still in flight (key `dec-live-001`, state `PROCESSING`) | `{"detail":"payment is already processing"}` | 409 |
+| no `Idempotency-Key` header | `{"detail":"Idempotency Key Missing"}` | 400 |
+| amount does not match (sent `10.00` for a `30.00` invoice) | `{"detail":"amount mismatch"}` | 400 |
+| another tenant asking for invoice `87` (Acme's key) | `{"detail":"no invoice to pay"}` | 404 |
+| no `Authorization` header | `{"detail":"Authentication credentials were not provided."}` | 401 |
+
+The 422 row is worth keeping in the README. Same key, same `30.00` amount, a
+different invoice — **only the `pk` inside `request_hash` catches it**. Without
+it, that request replays invoice `85`'s receipt while `87` stays `OPEN` and
+unpaid, silently. It is decision 7's `base_fee` collision, reproduced on demand.
+
+The 404 is byte-identical to a nonexistent invoice, so the response leaks
+nothing about whether the row exists.
+
+### Byte-identical replay — why `refresh_from_db()` is there
+
+`response_body` is a `JSONField`, which is `jsonb` on Postgres, and **`jsonb`
+does not preserve key order** — it re-sorts by key length, then alphabetically.
+Before this was handled, the first response carried the literal order of
+`invoice_dict` while the replay came back
+`id(2) amount(6) status(6) tenant(6) paid_at(7) currency(8) created_at(10)
+period_end(10) period_start(12)`. Same content, different bytes.
+
+Both paths now end:
+
+```python
+idem_key_object.save()
+idem_key_object.refresh_from_db()
+return idem_key_object.response_body, <status>
+```
+
+so the fresh response comes out of `jsonb` too. Cost is one extra `SELECT` per
+payment. The ordering was the visible symptom; the reason to keep it is that the
+returned body **is** the stored body by construction, not by two lines being kept
+in sync. Note `refresh_from_db()` alone changes nothing — it was added once and
+the returns still handed back the local dict, so it was a wasted query until the
+`return` lines were changed too.
+
+### Traps hit finishing 5b, worth not re-learning
+
+Every one of these produced a 500 or a silent wrong answer, and **none of them
+raised anywhere near the line that caused them**.
+
+- **Unpacking a dict gives you the keys, not the values.** The decline returned
+  one dict and the view did `invoice_dict, invoice_dict_status = ...`. A 2-key
+  dict unpacks happily into two names, so `invoice_dict` became `'detail'` and
+  the status became `'code'`. The failure surfaced two frames away as
+  `ValueError: invalid literal for int() with base 10: 'code'` from
+  `Response(status=...)`. Hit **three times** in one session as the body shape
+  changed — `'declined'`, then `'code'`, then `'detail'`. CLAUDE.md predicted
+  exactly this in session 2 ("a 2-key body would bind key *names* and look
+  plausible"); it still landed three times.
+- **A bare `return` in a branch the caller unpacks.** The first version of the
+  decline `return` fixed the ledger bug and created a new 500 — `None` cannot be
+  unpacked into two names. Adding the `return` is half the fix; the other half is
+  returning the same *shape* every other path returns.
+- **Storing a different body than you return.** At one point the decline stored
+  `{'detils': 'declined', 'code': 402}` and returned
+  `{'detail': 'payment declined', 'code': 'insufficient_funds'}`. Both requests
+  succeed, both look right in isolation, and the replay silently hands back a
+  different receipt than the original. This is the one bug in the list that a
+  green test suite would not catch unless the test compares the two responses to
+  each other. **One dict per path — build it, store it, return it.**
+- **`response_body = invoice` stores the model instance.** `JSONField` raises
+  `Object of type Invoice is not JSON serializable`. Fifth appearance of the
+  "only `str/int/float/bool/None/list/dict`" rule in this project.
+- **A variable assigned in only one branch.** After the success `body` dict was
+  deleted, `body['code']` still appeared twice on the success path, where `body`
+  now existed only inside `if declined:`. `UnboundLocalError: cannot access local
+  variable 'body' where it is not associated with a value`. Deleting a variable
+  means grepping for every read of it, not just the assignment.
+- **`refresh_from_db()` that nothing reads is a wasted `SELECT`.** It was added
+  to both paths while the `return` lines still handed back the local dicts, so
+  the extra query ran and the output was unchanged. Verified by re-running the
+  curls and getting the same mismatched key order.
+- **`jsonb` does not preserve key order.** See "Byte-identical replay" above.
+  Nothing errors; the two responses just differ in bytes while agreeing in
+  content.
+
+One process note that did work: every fix was verified by curling the running
+stack and reading the DB rows back, not by reading the diff. Three of the seven
+items above looked correct in the editor.
+
+### Orphaned `PROCESSING` rows — open, not designed
+
+Any exception raised *after* the claim commits leaves a row stuck at
+`PROCESSING` forever: the status check, the amount check when it moves, and
+(until 5b lands) the decline. Four such rows accumulated this session
+(`demo-key-002`, `fresh-001`, `fresh-002`, and others).
+
+That matters because the `PROCESSING` arm answers **409 "still in flight"**, which
+is a lie for a request that will never finish — the key is permanently unusable
+and the client cannot tell why. Two plausible fixes, neither chosen: clean up the
+row on those raise paths, or treat `PROCESSING` older than N seconds as stale.
+Decide before Phase 5 writes a test against that arm.
+
+## Phase 7 — horizontal scale (added 2026-08-09, nothing built)
+
+Scoped from a system-design discussion, not from the original six-phase spec.
+Deliberately its own phase rather than folded into Phase 6: Phase 6 gets a
+single container live and packaged, Phase 7 scales that. Splitting keeps Phase
+6's "Done when" reachable without a load balancer in the way, and means a broken
+LB cannot block having a live URL at all.
+
+Target topology — one Postgres, deliberately:
+
+```
+nginx  ->  web1  \
+       ->  web2  --> one Postgres
+```
+
+**Why it is worth doing at all.** The Phase 3 idempotency claim is a database
+unique constraint on `(tenant, key)`, not a Python lock. Two separate containers
+prove that distinction in a way a single process cannot: a `threading.Lock`, a
+module-level set, or an in-process cache would all pass a single-server test and
+break here. The one shared thing is the DB, which is exactly why the constraint
+is the only mechanism that can work. Same reasoning as
+`unique_active_subscription_per_tenant`.
+
+**What it does not do: it does not create the double-charge.** The existing
+two-thread repro (`CASH 60.00` on a `30.00` invoice, ledger sum `0.00`) is
+already valid evidence of the bug and stays the Phase 3 deliverable's "before".
+Phase 7 upgrades the "after" from *same process, monkeypatched sleep* to *two
+containers, real HTTP*. Stronger demo, not a different bug — do not oversell it
+as one in the README.
+
+Cost that comes with that: the race window can no longer be widened by
+monkeypatching `mock_payment_gateway` in a shell, because the two callers are in
+different processes. The gateway needs a real configurable delay (an env var
+like `GATEWAY_LATENCY_MS`, defaulting to 0) for the cross-container run to be
+reproducible.
+
+### The blocker: `migrate` in the Dockerfile `CMD`
+
+**Two replicas of the current image both run `migrate` on boot, concurrently,
+against the one database.** Django takes no lock around migrations, so both
+processes read the same unapplied list and both try to apply it — best case one
+dies on a duplicate `django_migrations` row, worst case half-applied DDL. This
+is the PID-1/`sh -c` item under Known open items showing its teeth for the
+second time (the first was a failed migration taking the web container down
+with `Exited (1)`).
+
+Migration has to leave the app container's start command before replicas > 1.
+
+**Decided: option 1, a one-shot `migrate` service in compose.** It runs
+`python manage.py migrate` and exits; both web services declare `depends_on`
+with `condition: service_completed_successfully`. The boot chain becomes
+`db healthy -> migrate exits 0 -> web1/web2 start`. Chosen because the `db`
+healthcheck already exists so the chain is half-built, and because it draws
+cleanly in the Phase 6 README architecture diagram. Side benefit: web's command
+becomes a single exec'd gunicorn process instead of `sh -c "a && b"`, which
+closes the PID-1 `SIGTERM` item at the same time.
+
+Rejected: **migrate as a manual deploy step outside compose** — what most real
+deploys do, and correct for backwards-incompatible migrations that need a human
+picking the moment, but nothing to show and more to explain. Rejected:
+**`pg_advisory_lock` in an entrypoint script** — works, but hand-rolls
+coordination the orchestrator already provides.
+
+### Build order inside the phase
+
+1. Phase 3 done — the `Idempotency-Key` claim works and a retry returns the
+   stored response on a single server. Landing the LB before this just produces
+   a fatter double-charge with nothing to demonstrate.
+2. Phase 5 green — tests passing single-server, so a test that fails after the
+   LB lands is unambiguously the LB's fault.
+3. gunicorn + real entrypoint, `migrate` split into its own service.
+   `runserver` is a single-process autoreloading dev server; two replicas of it
+   behind nginx is not a thing to put in a README.
+4. Settings from env — `DEBUG=False`, `ALLOWED_HOSTS`, `SECRET_KEY`. Already a
+   Known open item; nginx makes `ALLOWED_HOSTS` mandatory rather than optional,
+   since the Host header now arrives through a proxy.
+5. Scale to 2, put nginx in front, rerun the same-key retry proof across
+   containers.
+
+Two things that will bite at steps 3–4:
+
+- **`DEBUG=False` kills admin CSS.** `runserver` serves staticfiles
+  automatically only under `DEBUG`. Under gunicorn that stops, so `/admin/`
+  returns 200 with no styling until whitenoise or nginx serves `/static/`.
+- **Connection count multiplies.** 2 containers × gunicorn workers × Django's
+  persistent connections, against Postgres `max_connections` (default 100). Not
+  fatal at this size, but it is the honest reason PgBouncer exists and is worth
+  a line in the decision note.
+
+### Read replica and DB backups — considered and dropped
+
+Both were raised alongside the LB on 2026-08-09 and **dropped, not deferred**.
+Recorded so they are not re-proposed.
+
+A **read replica is not a backup**: streaming replication copies mistakes at
+wire speed, so `DELETE FROM billing_invoice` arrives on the replica in
+milliseconds. It also actively endangers this domain — replication lag breaks
+read-after-write, and `pay_invoice`'s `get()` is exactly such a path. A retry
+reading a lagging replica sees `status='OPEN'` on an invoice already paid on the
+primary and calls the gateway again, reintroducing the Phase 3 bug through
+infrastructure, underneath the application fix. Read replicas earn their keep
+when reads dominate and staleness is harmless; this API's read traffic is a
+couple of list views.
+
+**Backups were dropped by the author's call**, so no `pg_dump` schedule or
+snapshot policy is planned. Do not re-raise either.
 
 ## How to work with me on this
 
@@ -1606,7 +2198,11 @@ them unilaterally.
 Carried out of Phase 1:
 - Dockerfile `CMD` chains `migrate && runserver` via `sh -c`, so the shell is
   PID 1 and swallows `SIGTERM`. Fine for dev; Phase 6 wants a real entrypoint
-  script and a WSGI server instead of `runserver`.
+  script and a WSGI server instead of `runserver`. **Upgraded from cosmetic to
+  blocking by Phase 7** — two web replicas would both run `migrate` on boot
+  against the one database, and Django takes no lock around it. Splitting
+  `migrate` into its own one-shot compose service fixes both problems at once;
+  see the Phase 7 section.
 - `requirements.txt` lists `dotenv==0.9.9`. Cosmetic only — verified that package
   ships **no Python module**, just `dist-info` metadata declaring a dependency on
   `python-dotenv`. `from dotenv import load_dotenv` already resolves to
@@ -1667,6 +2263,10 @@ Schema and code cleanups:
 - `LedgerEntry.description` is still never set — both invoicing and payment write
   `''`. Now that there are two kinds of pair in the table, a readable line
   (`"payment for invoice 42"` vs the billing window) is worth more than it was.
+- **Orphaned `PROCESSING` idempotency rows.** Any raise after the claim commits
+  strands a row that can never complete, and the `PROCESSING` arm then answers
+  409 "still in flight" forever. See "Orphaned `PROCESSING` rows" under the
+  session-2 Phase 3 section. Decide before Phase 5 tests that arm.
 
 Validation layering (settled during the negative-money work, applies to every
 model from here on):
@@ -1735,6 +2335,13 @@ unchanged by it. Still **30** on 2026-08-09 — the Phase 3 payment work touched
 `services.py`, `views.py`, `serializers.py` and `urls.py` and added no file. The
 `Idempotency-Key` step will not add one either; `IdempotencyKey` has existed
 since `0001_initial`.
+
+That last sentence held for the claim itself but **not** for the session that
+built it: `billing/exceptions.py` was added on 2026-08-10 to hold the ten
+`APIException` subclasses, so the count goes to **31** on the next commit. It is
+currently untracked (`?? billing/exceptions.py`) — `git add` it, or the working
+tree imports a module that a fresh clone does not have and nothing starts. No
+migration was generated this session.
 
 `requirements.txt` gained `python-dateutil==2.9.0.post0` and its `six==1.17.0`
 dependency in `ff871e1`, for `relativedelta` in the period advance. A
