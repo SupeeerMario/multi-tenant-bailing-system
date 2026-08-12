@@ -51,6 +51,8 @@ class PlanSerializer(serializers.ModelSerializer):
 
 
 class SubscriptionsSerializer(serializers.ModelSerializer):
+    plan = serializers.PrimaryKeyRelatedField(queryset = models.Plan.objects.filter(is_active=True))
+
     class Meta:
         model = models.Subscription
         fields = [

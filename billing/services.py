@@ -70,8 +70,11 @@ def generate_invoice(tenant):
             frozen.update(invoice = invoice)
             LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = uuid_val, account = 'ACCOUNTS_RECEIVABLE', amount = amount, currency = plan.currency)
             LedgerEntry.objects.create(tenant = tenant, invoice = invoice, transaction_id = uuid_val, account = 'REVENUE', amount = -amount, currency = plan.currency)
-            active_subscription.current_period_start = period_end
-            active_subscription.current_period_end = period_end + relativedelta(months=1)
+            if plan.is_active:
+                active_subscription.current_period_start = period_end
+                active_subscription.current_period_end = period_end + relativedelta(months=1)
+            else:
+                active_subscription.status = "CANCELED"
             active_subscription.save()
 
     except IntegrityError:

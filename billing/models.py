@@ -107,7 +107,6 @@ class Invoice(models.Model):
     INVOICES_CHOICES = [
         ('PAID', 'Paid'),
         ('OPEN', 'Open'),
-        ('DRAFT', 'Draft'),
         ('VOID', 'Void')
     ]
 

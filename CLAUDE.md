@@ -11,19 +11,64 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Updated 2026-08-10, end of the third Phase 3 session. **Phase 3 is done, its
-"Done when" is met, and everything is committed and pushed.** Step 5b landed —
-`pay_invoice` returns `(body, status)` on every path, a decline is stored and
-replayed instead of raised, and both paths return `idem_key_object.response_body`
-after `refresh_from_db()` so a replay is byte-identical. A second commit made the
-already-paid `409` a stored answer too. The two-curl proof is pasted into this
-file — see "The two-curl proof" in `docs/journal/phase-3.md`.
+Updated 2026-08-12, second session that day. **Prerequisite 1 is built and
+verified live, all three steps.** Phase 3 remains done, its "Done when" met and
+committed. The prerequisite-1 work is **uncommitted** as of this write —
+`billing/models.py`, `billing/serializers.py`, `billing/services.py` and the new
+`billing/migrations/0008_alter_invoice_status.py` are still in the working tree.
 
-**Next action: Phase 4, but two prerequisites first — the author chose to do
-both before the worker.** See "Phase 4 — the two prerequisites" below for the
-decision each one needs. Neither is started.
+What landed, and the evidence for each:
 
-Then Phase 4 proper, in this order:
+1. **The serializer guard**, `billing/serializers.py:55` — the explicit
+   `plan = serializers.PrimaryKeyRelatedField(queryset = models.Plan.objects.filter(is_active=True))`
+   above `class Meta` on `SubscriptionsSerializer`. **Verified per-request, not
+   frozen at import**: with plan `2` active the POST returned `409` (the
+   `unique_active_subscription_per_tenant` conflict, which means the field
+   passed); flipping `is_active=False` in the shell **without restarting `web`**
+   turned the same POST into `400 {"plan":["Invalid pk \"2\" - object does not
+   exist."]}`; flipping back returned it to `409`. The 400 arrives before the
+   view reaches the constraint, and no subscription was written on either `409`,
+   so the baseline is untouched.
+
+   **Trap worth keeping:** the first attempt put that line on `PlanSerializer`.
+   A `Plan` has no `plan` field, so it guarded nothing *and* took the plans
+   endpoint down entirely — DRF asserts every declared field appears in
+   `Meta.fields`, so every request touching the serializer 500s with
+   `The field 'plan' was declared on serializer PlanSerializer, but has not been
+   included in the 'fields' option.` A declared field on the wrong serializer is
+   not a no-op.
+2. **The `generate_invoice` branch**, `billing/services.py:73-77` — inside the
+   same `with transaction.atomic():` that opens at line 68, with
+   `active_subscription.save()` left **outside** the `if/else` so both arms
+   persist. Verified live inside one rolled-back `transaction.atomic()` using a
+   throwaway tenant, plan and subscription (period `Jun 1 -> Jul 1`, already
+   ended):
+
+   - **Inactive plan:** invoice written `OPEN` for the full `Jun 1..Jul 1`
+     window, 2 ledger rows, sum `0.00`, one shared `transaction_id`, then
+     `status=CANCELED` with `current_period_start` / `current_period_end` left
+     at the last billed window. The second wake raised
+     `NoActiveSubscription: tenant 43 has no active subscription` — accrual
+     stops, exactly as option (b) intends.
+   - **Active plan (control):** advanced to `Jul 1 -> Aug 1`, stayed `ACTIVE`.
+     Its second wake generating another invoice is **correct**, not a bug — that
+     window has also ended as of Aug 12, so it is the documented one-cycle-per-
+     wake catch-up.
+
+   Counts after rollback confirmed the baseline: `tenants=4 plans=1 subs=5
+   invoices=4 ledger=8`. Only residue is the invoice id sequence burning `91`
+   and `92`, which Postgres sequences do regardless of rollback.
+
+   **What that test cannot prove:** it rolls back both writes, so it never
+   demonstrates that the invoice and the cancel commit *together*. That
+   guarantee comes from the code being inside one `atomic()` block, not from the
+   run.
+3. **`DRAFT` dropped** from `INVOICES_CHOICES` at `billing/models.py:110`, with
+   `0008_alter_invoice_status.py` carrying the `AlterField` only. Applied —
+   `showmigrations` reads `[X] 0008`. Grep confirms no `DRAFT` outside
+   `0001_initial.py`, which stays untouched.
+
+**Next action: prerequisite 2**, then Phase 4 proper, in this order:
 
 1. **The worker as a management command, no scheduler.**
    `manage.py generate_invoices` loops every tenant, calls
@@ -85,39 +130,57 @@ on this stack — see item 1 under "Still not started" in
 ### Phase 4 — the two prerequisites
 
 Both were raised as things that bite the moment an unattended worker exists, and
-the author chose to do them **before** step 1. Neither is started; each needs a
-decision before any code.
+the author chose to do them **before** step 1. **Prerequisite 1 is built and
+verified; prerequisite 2 is still blocked on data.**
 
-**1. Nothing checks `plan.is_active` before subscribing.** Decide what
-`is_active` *means* first, because it changes where the check goes:
+**1. Nothing checks `plan.is_active` before subscribing. DECIDED 2026-08-12:
+`is_active = False` means "no tenant can subscribe AND no billing is provided" —
+reading 2 — with mid-cycle deactivation resolved as (b), bill the final full
+period then cancel. BUILT AND VERIFIED 2026-08-12** — the serializer guard, the
+`generate_invoice` branch and the `DRAFT` drop are all in the working tree, with
+the live evidence recorded under "Start here next session". What follows is why
+the decision went this way; keep it, because the reasoning is not recoverable
+from the three lines of code it produced.
 
-- **"Not available for new subscriptions"** — existing subscribers are
-  grandfathered and keep being billed. The fix is then **only** in
-  `SubscriptionsSerializer` and `generate_invoice` needs no check at all.
-- **"Stop billing entirely"** — the worker has to check too, and that needs an
-  answer for a plan deactivated mid-cycle: bill the partial period, skip
-  silently, or cancel the subscription.
+Reading 2 means the worker has to check too, which forced a second question: a
+plan deactivated **mid-cycle**. Concretely — Acme's cycle is `Aug 1 -> Sep 1`,
+admin sets `is_active=False` on Aug 15, the worker wakes Sep 1:
 
-The first reading is the recommendation. Deactivating a price should not stop
-revenue from customers already on it, and the second reading hands the worker a
-silent skip path, which is the failure mode this project keeps hitting (the
-stale-window invoice, the `relativedelta(month=1)` cascade, the behind-by-a-cycle
-skip — none of them raised anything).
+- **(a) skip silently — rejected.** `generate_invoice` raises, the worker catches
+  `BillingError` and continues. `current_period_end` never advances, the
+  subscription stays `ACTIVE`, and the usage endpoint keeps accepting events that
+  no window will ever bill. Silent revenue loss with nothing raised — the exact
+  shape of the stale-window invoice, the `relativedelta(month=1)` cascade, and
+  the behind-by-a-cycle skip.
+- **(b) bill the final full period, then cancel — CHOSEN.** The customer had
+  access for the whole month, so the month is billed; then `status = 'CANCELED'`
+  instead of the period advance. The next wake raises `NoActiveSubscription`,
+  accrual stops, and the usage endpoint is closed too (it resolves the
+  subscription with `get(status='ACTIVE')`). Needs no new fields. Events recorded
+  between the deactivation and the worker run fall inside the billed window and
+  are charged correctly.
+- **(c) hard stop, no final invoice — rejected.** Matches "no billing" most
+  literally, but Aug 1–15 usage is then served free.
 
-Under the first reading it is one line on `SubscriptionsSerializer`:
-
-```python
-plan = serializers.PrimaryKeyRelatedField(queryset = models.Plan.objects.filter(is_active = True))
-```
-
-An inactive plan then 400s with `Invalid pk "N" - object does not exist.`, the
-same message as a nonexistent plan, which leaks nothing.
+Consequence, now confirmed live rather than predicted: a `CANCELED` row keeps its
+old `current_period_start` / `current_period_end`. That is stale but harmless —
+it now reads as "last billed period", and a later re-subscribe creates a new row
+with its own window.
 
 **This one cannot have the usual DB guarantee.** A Postgres `CHECK` cannot
 reference another table, so no `CheckConstraint` can say "the plan I point at is
 active". The validation-layering rule from the negative-money work does not fully
-apply — there is a serializer layer and, under the second reading, a service
-layer, and that is all. Do not go looking for the constraint later.
+apply — there is a serializer layer and a service layer, and that is all. Do not
+go looking for the constraint later.
+
+**`DRAFT` is dropped alongside this, decided and done 2026-08-12** (migration
+`0008`, applied). Nothing writes it and
+there is no gap for it to live in: `generate_invoice` writes `OPEN` and books the
+AR pair in the same `atomic()` block, whereas `DRAFT`'s real meaning in billing is
+"invoice exists, no ledger pair booked yet". It would also sit outside
+`unique_open_invoice_per_tenant`'s partial index and pile up freely. `VOID`
+stays — it is the only correct cancel path and `void_invoice` is one of the two
+ways to unblock prerequisite 2 below.
 
 **2. `unique_open_invoice_per_tenant` — agreed since 2026-08-09, still unbuilt,
 and blocked on data.** The constraint is two lines on `Invoice.Meta`:
@@ -164,7 +227,7 @@ remaining item rather than going along with it.
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
 | 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" in `docs/journal/phase-3.md`. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
-| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **Unblocked** (2026-08-10) — not started |
+| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **In progress** — prerequisite 1 built and verified live (2026-08-12): serializer `is_active` guard, the `generate_invoice` cancel branch, `DRAFT` dropped. Prerequisite 2 (`unique_open_invoice_per_tenant`) still blocked on Acme's three `OPEN` invoices. Worker, schedule and isolation test not started |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
 | 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
 | 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | Blocked on 6 (2026-08-09) |
