@@ -30,7 +30,8 @@ class PaymentAlreadyProcessing(BillingError):
 class RequestHashDiffers(BillingError):
     pass
 
-
+class OpenInvoiceNotPaid(BillingError):
+    pass
 
 
 
@@ -45,6 +46,11 @@ def generate_invoice(tenant):
 
     period_start = active_subscription.current_period_start
     period_end = active_subscription.current_period_end
+
+    open_invoice = Invoice.objects.filter(tenant = tenant, status = 'OPEN').first()
+    if open_invoice:
+        raise OpenInvoiceNotPaid(f'tenant {tenant.id} has an open invoice {open_invoice.id}')
+
 
     if period_end > timezone.now():
         raise PeriodNotEnded(f'Cannot make a bill for {period_end} as the period has not ended')
@@ -77,9 +83,15 @@ def generate_invoice(tenant):
                 active_subscription.status = "CANCELED"
             active_subscription.save()
 
-    except IntegrityError:
-        raise InvoiceAlreadyExists(f"tenant {tenant.id} has already been invoiced a bill from {period_start} to {period_end}")
+    except IntegrityError as e:
+        name = getattr(getattr(e, '__cause__', None), 'diag', None)
+        name = getattr(name, 'constraint_name', None)
 
+        if name == 'unique_invoice_period':
+            raise InvoiceAlreadyExists(f"tenant {tenant.id} has already been invoiced a bill from {period_start} to {period_end}")
+        if name == 'unique_open_invoice_per_tenant':
+            raise OpenInvoiceNotPaid(f'tenant {tenant.id} has an open invoice')
+        raise
     
     return invoice
 

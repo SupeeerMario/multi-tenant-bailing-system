@@ -61,3 +61,7 @@ class RequestHashDiffers(APIException):
     default_code = 'request_hash_differs'
 
 
+class OpenInvoiceNotPaid(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = 'open invoice not paid'
+    default_code = 'open_invoice_not_paid'

@@ -82,6 +82,8 @@ class InvoiceAPIView(APIView):
             raise exceptions.InvoiceAlreadyExists(e)
         except services.NoActiveSubscription as e:
             raise exceptions.NoActiveSubscription(e)
+        except services.OpenInvoiceNotPaid as e:
+            raise exceptions.OpenInvoiceNotPaid(e)
 
         
         invoice_data = serializers.InvoiceSerializer(invoice).data
@@ -129,6 +131,7 @@ class InvoicesPay(APIView):
             raise exceptions.RequestHashDiffers(e)
         except services.PaymentAlreadyProcessing as e:
             raise exceptions.PaymentAlreadyProcessing(e)
+
 
 
         return Response(invoice_dict, status= invoice_dict_status)

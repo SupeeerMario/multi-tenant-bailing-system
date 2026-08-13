@@ -127,7 +127,15 @@ class Invoice(models.Model):
                     'period_start',
                     'period_end'
                 ],   
-                name = 'unique_invoice_period'
+                name = 'unique_invoice_period',
+                condition=~Q(status='VOID')
+            ),
+            models.UniqueConstraint(
+                fields = [
+                    'tenant'
+                    ],
+                name = 'unique_open_invoice_per_tenant',
+                condition = Q(status = 'OPEN')
             )
         ]
 

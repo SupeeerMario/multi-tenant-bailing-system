@@ -11,11 +11,170 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Updated 2026-08-12, second session that day. **Prerequisite 1 is built and
-verified live, all three steps.** Phase 3 remains done, its "Done when" met and
-committed. The prerequisite-1 work is **uncommitted** as of this write —
-`billing/models.py`, `billing/serializers.py`, `billing/services.py` and the new
-`billing/migrations/0008_alter_invoice_status.py` are still in the working tree.
+Updated 2026-08-13.
+
+## FIRST THING NEXT SESSION — Phase 4 step 1, the worker
+
+**Both Phase 4 prerequisites are done.** The `generate_invoice` guard and the
+`except IntegrityError` discriminator landed 2026-08-13 and are verified live;
+what they do and how they were proven is under "History — prerequisite 2" below.
+Nothing is half-built in the working tree.
+
+Next, in this order:
+
+1. **The worker as a management command, no scheduler.**
+   `manage.py generate_invoices` loops every tenant, calls
+   `services.generate_invoice(tenant)`, catches `BillingError` and continues.
+   The service is already shaped for it: it raises rather than returns, the
+   window comes from the subscription, and a tenant that is not due raises
+   `PeriodNotEnded` and is skipped. With the guard in place, a tenant holding an
+   unpaid invoice now raises `OpenInvoiceNotPaid` and is skipped **with a
+   truthful reason in the log**, which is the whole point of having done the
+   prerequisites first.
+2. **Then the schedule.** Undecided: Celery + beat (heavier, real, another
+   compose service) versus a loop container running the command on an interval
+   (trivial, honest for a demo).
+3. **Then the isolation test** — the project's **first test**, so it lands test
+   infrastructure too. Target is `UsageEventListCreateView`; `GET billing/usage/`
+   is the only proven read-isolation path.
+
+Optional and cheap, not blocking: `SubscriptionsCreateView.perform_create`'s bare
+`except IntegrityError` (the oldest unstarted Phase 2 item) can now reuse the
+discriminator. Read "What is actually wrong with the subscription view" below
+first — the payoff there is smaller than it looks, and copy-pasting the walk into
+`views.py` is the wrong shape.
+
+## History — prerequisite 2, done 2026-08-13
+
+**Both pieces built and verified live in rolled-back transactions.** This closes
+the last Phase 4 prerequisite.
+
+**1. The guard**, `billing/services.py:50-52` — above the `try:` and above
+`with transaction.atomic():`, before the `PeriodNotEnded` check:
+
+```python
+open_invoice = Invoice.objects.filter(tenant = tenant, status = 'OPEN').first()
+if open_invoice:
+    raise OpenInvoiceNotPaid(f'tenant {tenant.id} has an open invoice {open_invoice.id}')
+```
+
+`OpenInvoiceNotPaid` is a new `BillingError` in `services.py` with its
+`APIException` twin in `exceptions.py` at `409`, wired into `InvoiceAPIView.post`.
+`InvoiceAlreadyExists` was deliberately **not** reused — the two mean different
+things: `unique_invoice_period` asks "is *this window* already billed?",
+`unique_open_invoice_per_tenant` asks "does this tenant owe money *right now?*",
+and the second is window-independent.
+
+Verified live, baseline `4/1/5/4/12` unchanged before and after:
+
+```
+Acme, period NOT ended        OpenInvoiceNotPaid | tenant 13 has an open invoice 17
+Acme, period forced past      OpenInvoiceNotPaid | tenant 13 has an open invoice 17
+clean tenant, ended period    invoice 96 OPEN 10.00      <- must NOT raise
+same tenant now holds 96      OpenInvoiceNotPaid | tenant 45 has an open invoice 96
+```
+
+Row three is the one that matters. The first draft used
+`Invoice.objects.get(...)`, which raises `Invoice.DoesNotExist` when there is no
+`OPEN` invoice — a plain `Exception`, invisible to DRF, so **every clean tenant's
+generate call was a 500**. `.first()` and a `None` test, not `get()`. The `if`
+around a `get()` is dead code besides: `get()` never returns falsy.
+
+**2. The discriminator**, `billing/services.py:86-94` — replaces the single
+`except IntegrityError` that blamed `unique_invoice_period` whichever constraint
+fired:
+
+```python
+except IntegrityError as e:
+    name = getattr(getattr(e, '__cause__', None), 'diag', None)
+    name = getattr(name, 'constraint_name', None)
+    if name == 'unique_invoice_period': ...
+    if name == 'unique_open_invoice_per_tenant': ...
+    raise
+```
+
+The chain is `IntegrityError` -> `e.__cause__` (`psycopg.errors.UniqueViolation`)
+-> `.diag` (`psycopg.errors.Diagnostic`) -> `.constraint_name` (the string).
+**Match on the name, not the type** — both of these are `UniqueViolation`, so
+`type(e.__cause__)` cannot separate them. The `getattr` guards matter because an
+`AttributeError` raised *inside* the handler replaces the `IntegrityError` and
+the traceback then names the wrong bug entirely; the bare `raise` at the end
+sends anything unmatched up as a 500, which is the honest answer for an
+integrity error nobody anticipated.
+
+Verified live, each branch isolated, baseline unchanged:
+
+```
+PAID invoice covers the same window, guard passes naturally
+  InvoiceAlreadyExists | tenant 46 has already been invoiced ... 2026-06-14 to 2026-07-14
+OPEN invoice on a DIFFERENT window, guard blinded to fake the race
+  OpenInvoiceNotPaid | tenant 47 has an open invoice
+```
+
+The second is the exact input the old code got wrong. Blinding the guard —
+`mock.patch.object(Invoice.objects, 'filter')` returning `None` — is how the
+concurrent race was simulated without threads; `Invoice.objects.filter` appears
+nowhere else in `generate_invoice`, so the patch is precise.
+
+**Trap, caught in review before it ran:** the first discriminator interpolated
+`open_invoice.id` into the `unique_open_invoice_per_tenant` message. Execution
+only reaches the `try` when `open_invoice is None` — the guard raised otherwise —
+so that branch was a guaranteed `AttributeError: 'NoneType' object has no
+attribute 'id'` inside the `except`. The `except` branch has no invoice in hand
+by construction; it knows a constraint name and nothing else.
+
+**Not verified:** the bare `raise` fallthrough. No unmatched integrity error is
+reachable through `generate_invoice` today, so that arm is untested — do not
+record it as proven.
+
+**Ordering consequence, confirmed live.** The guard sits **above** the
+`PeriodNotEnded` check, so a tenant holding an unpaid invoice answers
+`OpenInvoiceNotPaid` even when its window has not ended. Acme today
+(`Aug 1 -> Sep 1`, not ended, invoice `17` `OPEN`) therefore answers
+`OpenInvoiceNotPaid`, **not** the `PeriodNotEnded` recorded further down this
+file. Over HTTP nothing changes — `InvoiceAPIView.post` duplicates both checks
+itself at `billing/views.py:71-77` and raises `PeriodNotEnded` before the service
+is ever called. Only the worker sees the service's own ordering.
+
+### What is actually wrong with the subscription view
+
+`SubscriptionsCreateView.perform_create` (`billing/views.py:37-41`) still reports
+every `IntegrityError` as `SubscriptionAlreadyExists`. Now that the discriminator
+exists, closing it looks like a copy-paste. Three reasons it is not:
+
+1. **The second branch is unreachable from that view.** `Subscription` has two
+   constraints — `unique_active_subscription_per_tenant` and
+   `prevent_zero_length_period` (`billing/models.py:88-100`). The view computes
+   `period_end = period_start + relativedelta(months = 1)`, which is *always*
+   greater than `period_start`, so the check constraint can never fire on that
+   path. The journal's `UniqueViolation` vs `CheckViolation` example
+   (`docs/journal/phase-2.md`, item 1 under "Still not started") predates that
+   line. The discriminator there degrades to "match one name, else re-raise" —
+   still worth doing, because an unanticipated integrity error currently gets a
+   confident 409 explaining the wrong thing, but the payoff is smaller than the
+   journal implies.
+2. **`.diag` is psycopg-specific.** It is already a driver dependency inside
+   `services.py`; pasting the walk into `views.py` spreads it to a second module.
+   One shared helper — `constraint_name_of(exc)` — imported by both is the right
+   shape, and the `services.py` copy should move into it at the same time.
+3. **The constraint names would then be strings duplicated across three files**
+   (`models.py`, `services.py`, `views.py`). A typo in a comparison is silent:
+   the branch simply never fires and the caller gets a 500 that looks unrelated.
+   Module-level constants that `models.py` and both consumers reference kill
+   that.
+
+**Committed 2026-08-13** together with the leftovers from the previous session:
+`CLAUDE.md`, `billing/models.py`,
+`billing/migrations/0009_remove_invoice_unique_invoice_period_and_more.py`,
+`billing/migrations/0010_invoice_unique_open_invoice_per_tenant.py`. Both
+migrations were **already applied to the dev database** before the commit. The
+Acme data repair is applied too and is tracked in no file — only
+`scratchpad/untangle_acme.py`, which is outside the repo and will not survive.
+
+## History — prerequisite 1, done and committed as `774c91f`
+
+**Prerequisite 1 is built and verified live, all three steps.** Phase 3 remains
+done, its "Done when" met and committed.
 
 What landed, and the evidence for each:
 
@@ -68,41 +227,92 @@ What landed, and the evidence for each:
    `showmigrations` reads `[X] 0008`. Grep confirms no `DRAFT` outside
    `0001_initial.py`, which stays untouched.
 
-**Next action: prerequisite 2**, then Phase 4 proper, in this order:
+Phase 4 proper — worker, schedule, isolation test — is listed once at the top of
+this file under "FIRST THING NEXT SESSION". Do not maintain a second copy here.
 
-1. **The worker as a management command, no scheduler.**
-   `manage.py generate_invoices` loops every tenant, calls
-   `services.generate_invoice(tenant)`, catches `BillingError` and continues.
-   That loop is already designed for: the service raises rather than returns, the
-   window comes from the subscription, and a tenant that is not due raises
-   `PeriodNotEnded` and is skipped.
-2. **Then the schedule.** Undecided: Celery + beat (heavier, real, another
-   compose service) versus a loop container running the command on an interval
-   (trivial, honest for a demo).
-3. **Then the isolation test** — the project's **first test**, so it lands test
-   infrastructure too. Target is `UsageEventListCreateView`; `GET billing/usage/`
-   is the only proven read-isolation path.
+### Dev database baseline — moved 2026-08-12, read this before trusting old numbers
 
-**Dev database is on baseline, verified 2026-08-10 after three rounds of demo
-rows were deleted** (tenants `40 KeyTest`, `41 OrphanDemo`, `42
-AlreadyPaidDemo`, with their invoices `78`–`90`, ledger rows and 18
-`IdempotencyKey` rows). Deletes ran in `PROTECT` order, and a pre-delete check
-confirmed no row outside the throwaway tenant referenced its invoices.
+**Acme was wedged and is now repaired.** The three-`OPEN`-invoice state the
+earlier baseline recorded was not just in the way of prerequisite 2 — it was
+broken data that the Phase 4 worker would have hit silently. Diagnosis, in
+order:
 
-Counts read **`4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4
-invoices / 8 ledger rows`**, ledger sum `0.00`, `0` idempotency keys. Invoices
-are `17` (`30.00`), `18` (`39.44`), `19` (`20.00`) for Acme and `20` (`36.67`)
-for Globex, all still `OPEN`. No demo payment ever touched real seed data,
-deliberately.
+- Acme's invoices `18` (`Aug 1 -> Sep 1`) and `19` (`Sep 1 -> Oct 1`) were both
+  created `2026-08-05`, billing periods that **had not ended**. Today's code
+  cannot produce them — `PeriodNotEnded` fires first — so they are artifacts of
+  the pre-`fb35920` signature, when the caller supplied the window. Nothing is
+  wrong with the current service.
+- Subscription `8` still pointed at `Jul 1 -> Aug 1`, behind both, because the
+  old path never advanced it. That window has ended, so every wake tried to
+  rebill it and hit invoice `17`. Confirmed live in a rolled-back transaction:
+  `InvoiceAlreadyExists: tenant 13 has already been invoiced a bill from
+  2026-07-01 ... to 2026-08-01`. `InvoiceAlreadyExists` is a `BillingError`, so
+  the worker would have caught it and skipped — **Acme silently never bills
+  again, with nothing raised where a human looks.**
 
-The stronger invariant passes per tenant — `sum(ACCOUNTS_RECEIVABLE)` equals the
-tenant's outstanding `OPEN` invoices: Acme `89.44`, Globex `36.67`, Initech and
-`test name` `0`. That is the check that catches what sum-to-zero misses.
+The repair, run 2026-08-12 in one `transaction.atomic()`, by hand in the shell —
+**it lives in no migration and no service, only in
+`scratchpad/untangle_acme.py`**:
 
-**Note this baseline is about to change by design.** Item 2 below cannot be
-built while Acme has three `OPEN` invoices, so whichever way that is resolved,
-these numbers move and this section must be re-read afterwards rather than
-trusted.
+- `18` and `19` voided *properly*: a reversing pair each
+  (`ACCOUNTS_RECEIVABLE -amount` / `REVENUE +amount`, one new `transaction_id`
+  per invoice, `description` actually set — `void of invoice 18`), then
+  `status='VOID'`. The ledger was appended to, never edited.
+- Usage event `5` (`7777` units, Aug 1) released from `18` back to
+  `invoice=None`. **`UsageEvent.invoice` is `SET_NULL`, but `SET_NULL` only
+  fires on delete** — voiding does not delete, so without this line the event
+  stays stamped to a void invoice and is never billed again. Any future
+  `void_invoice` service must carry this explicitly.
+- Subscription `8` advanced to `Aug 1 -> Sep 1`, past what invoice `17`
+  legitimately covers.
+
+**New baseline, verified 2026-08-12:**
+
+```
+4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices / 12 ledger rows
+global ledger sum 0.00, 0 idempotency keys
+  Acme       AR=30.00  outstanding OPEN=30.00  PASS
+  Globex     AR=36.67  outstanding OPEN=36.67  PASS
+  Initech    AR=0      OPEN=0                  PASS
+  test name  AR=0      OPEN=0                  PASS
+```
+
+Acme's invoices are now `17` `30.00` `OPEN` (`Jul 1 -> Aug 1`), `18` `39.44`
+`VOID`, `19` `20.00` `VOID`; Globex still holds `20` (`36.67`, `OPEN`). Ledger
+went `8 -> 12` rows globally (Acme `6 -> 10`). The stronger invariant —
+`sum(ACCOUNTS_RECEIVABLE)` equals outstanding `OPEN` — passes for every tenant,
+which is the check that catches what sum-to-zero misses. No demo payment has
+ever touched real seed data, deliberately.
+
+Acme's next wake was recorded here as answering `PeriodNotEnded: Cannot make a
+bill for 2026-09-01 ... as the period has not ended`. **Stale as of 2026-08-13**
+— the new guard sits above the period check, so the service now answers
+`OpenInvoiceNotPaid: tenant 13 has an open invoice 17`. Both statements are true
+and either way it is a correct skip. Over HTTP it is still `PeriodNotEnded`,
+because the view checks that itself first. On Sep 1, once `17` is paid or voided,
+it bills `Aug 1 -> Sep 1` and picks up the released event `5`.
+
+**That last part only works because of `0009`.** `unique_invoice_period` was
+unconditional, so a `VOID` row kept reserving its period forever and voiding
+`18` would have re-wedged Acme on Sep 1 with the identical error. The constraint
+now carries `condition=~Q(status='VOID')` (`billing/models.py:130`), applied as
+migration `0009_remove_invoice_unique_invoice_period_and_more` — a
+`RemoveConstraint` plus an `AddConstraint`, which validates trivially because
+the new index covers strictly fewer rows than the old one. Postgres renders it:
+
+```
+"unique_invoice_period" UNIQUE, btree (tenant_id, period_start, period_end)
+  WHERE NOT status::text = 'VOID'::text
+```
+
+Same mechanism as `unique_active_subscription_per_tenant`, condition inverted. A
+voided invoice drops out of the index entirely, so its period is free to be
+rebilled — which is what voiding is supposed to mean. Two `OPEN`s, or an `OPEN`
+plus a `PAID`, on one window are still rejected; neither is `VOID`. `status` is
+`NOT NULL`, so the `~Q` has no NULL hole.
+
+**Committed 2026-08-13** alongside the guard work. The data repair is applied to
+the database and is in no file under version control.
 
 Left open in Phase 3, not blocking the commit, and all three are the same
 question about key lifetime — decide them together:
@@ -121,11 +331,13 @@ See "A decline burns the key" and "Orphaned `PROCESSING` rows" in
 `docs/journal/phase-3.md` for the
 shapes and the race that the TTL has to avoid.
 
-Still the oldest unstarted Phase 2 item, untouched for a fifth session:
+Still the oldest unstarted Phase 2 item, untouched for a sixth session:
 narrowing the bare `except IntegrityError` in
-`SubscriptionsCreateView.perform_create`. The discriminator is already confirmed
-on this stack — see item 1 under "Still not started" in
-`docs/journal/phase-2.md`.
+`SubscriptionsCreateView.perform_create`. The discriminator now exists in
+`services.py` and is verified, but read "What is actually wrong with the
+subscription view" at the top of this file before pasting it across — item 1
+under "Still not started" in `docs/journal/phase-2.md` describes a
+`CheckViolation` branch that view can no longer reach.
 
 ### Phase 4 — the two prerequisites
 
@@ -179,40 +391,47 @@ there is no gap for it to live in: `generate_invoice` writes `OPEN` and books th
 AR pair in the same `atomic()` block, whereas `DRAFT`'s real meaning in billing is
 "invoice exists, no ledger pair booked yet". It would also sit outside
 `unique_open_invoice_per_tenant`'s partial index and pile up freely. `VOID`
-stays — it is the only correct cancel path and `void_invoice` is one of the two
-ways to unblock prerequisite 2 below.
+stays — it is the only correct cancel path, and it is what unblocked
+prerequisite 2 below.
 
-**2. `unique_open_invoice_per_tenant` — agreed since 2026-08-09, still unbuilt,
-and blocked on data.** The constraint is two lines on `Invoice.Meta`:
+**2. `unique_open_invoice_per_tenant` — DONE. The constraint was built and
+applied 2026-08-12 (migration `0010`); the `OpenInvoiceNotPaid` guard and the
+`except IntegrityError` discriminator landed and were verified live
+2026-08-13** — evidence under "History — prerequisite 2" at the top of this file.
+What is in `Invoice.Meta`:
 
 ```python
 models.UniqueConstraint(fields = ['tenant'], condition = Q(status = 'OPEN'),
                         name = 'unique_open_invoice_per_tenant')
 ```
 
-plus the matching guard at the **top of `generate_invoice`, before the
-`atomic()` block** — placed there the period advance never runs, so an unpaid
-invoice *pauses* the cycle instead of sliding past unbilled usage.
+`AddConstraint` validates existing rows, and it used to fail exactly like the
+`-99.00` plan did, because Acme held three `OPEN` invoices. **Cleared
+2026-08-12** by the void repair described under "Dev database baseline" above —
+Acme is down to invoice `17` alone and every tenant has at most one `OPEN`, so
+`0010` applied cleanly, a single `AddConstraint` with no `RemoveConstraint`.
 
-`AddConstraint` validates existing rows, and Acme has three `OPEN` invoices
-(`17`, `18`, `19`), so it fails exactly like the `-99.00` plan did. Two ways to
-clear it, and **neither is free**:
+The two ways of clearing it were weighed and **voiding won on the merits, not on
+cost**: `18` and `19` were invoices for periods that had never ended, so paying
+them would have booked `CASH` for money that was never legitimately owed.
 
-- **Pay two through the API.** Real code path, AR drops correctly, every
-  invariant holds. Cost: the documented baseline moves — ledger `8` → `12` rows,
-  Acme AR `89.44` → `30.00`, two invoices become `PAID`. This section has to be
-  rewritten afterwards.
-- **Void two.** `VOID` already exists in `INVOICES_CHOICES`, so no migration.
-  But setting `status='VOID'` by hand **breaks the ledger invariant**: AR was
-  booked `+39.44` and `+20.00` when those invoices were generated, and voiding
-  does not unbook it, so Acme AR stays `89.44` while `OPEN` sums to `30.00`. The
-  ledger is append-only, so a correct void writes a **reversing pair**
-  (`ACCOUNTS_RECEIVABLE -amount` / `REVENUE +amount`) — which means writing a
-  `void_invoice` service.
+**Do not re-derive the guard placement from the old rationale.** The line that
+used to sit here — "placed at the top the period advance never runs" — was
+wrong. The advance is inside `atomic()` and rolls back either way, so you get
+that outcome from the rollback, not from where the guard sits. The real reason
+for the placement is that it is a precondition: check before doing work, so the
+caller gets a truthful error instead of a misattributed one. Same correction
+applies to the guard-placement rationale in `docs/journal/phase-3.md`.
 
-Paying is the cheap one. Voiding is the more useful one — `void_invoice` will be
-wanted eventually and is currently the only operation in the domain with no code
-path at all.
+**`void_invoice` is still unwritten.** The repair was done by hand in the shell,
+so the domain still has no code path for voiding — it remains the only operation
+here with none. When it gets written, it has to do all three things the manual
+repair did: append the reversing pair (`ACCOUNTS_RECEIVABLE -amount` /
+`REVENUE +amount`, one shared new `transaction_id`), release the invoice's usage
+events to `invoice=None`, and only then set `status='VOID'`, all in one
+`atomic()` block. Setting the status alone **breaks the ledger invariant** — AR
+stays booked while `OPEN` no longer counts the invoice, and the books read
+settled while still claiming the money.
 
 ## Phase gating — read this first
 
@@ -227,7 +446,7 @@ remaining item rather than going along with it.
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
 | 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" in `docs/journal/phase-3.md`. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
-| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **In progress** — prerequisite 1 built and verified live (2026-08-12): serializer `is_active` guard, the `generate_invoice` cancel branch, `DRAFT` dropped. Prerequisite 2 (`unique_open_invoice_per_tenant`) still blocked on Acme's three `OPEN` invoices. Worker, schedule and isolation test not started |
+| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **In progress** — **both prerequisites done.** 1 (2026-08-12): serializer `is_active` guard, the `generate_invoice` cancel branch, `DRAFT` dropped. 2 (2026-08-12/13): Acme repaired, `0009` made `unique_invoice_period` skip `VOID` rows, `0010` added `unique_open_invoice_per_tenant`, and 2026-08-13 the `OpenInvoiceNotPaid` guard plus the `except IntegrityError` constraint-name discriminator landed and were verified live. **Worker, schedule and isolation test not started — the worker is the first job next session** |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
 | 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
 | 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | Blocked on 6 (2026-08-09) |
@@ -777,10 +996,20 @@ Schema and code cleanups:
   (nothing in the block would reject zero) but it silently disables any check
   added there later. Guard on `is not None`.
 - Consider migrating existing choice sets to `TextChoices`.
-- `unique_open_invoice_per_tenant` is agreed and unbuilt. `AddConstraint` will
-  fail until Acme is down to one OPEN invoice — it currently has `17`, `18`, `19`.
-  See `docs/journal/phase-3.md` for the shape and for why the matching guard belongs at
-  the top of `generate_invoice`, before the `atomic()` block.
+- ~~`unique_open_invoice_per_tenant` has no guard in `generate_invoice`~~ —
+  **closed 2026-08-13.** Constraint applied as `0010`, guard and constraint-name
+  discriminator built and verified live. Ignore the guard-placement rationale in
+  `docs/journal/phase-3.md`; it was wrong and is corrected in "Phase 4 — the two
+  prerequisites", item 2.
+- **The bare `except IntegrityError` in `SubscriptionsCreateView.perform_create`
+  is still bare** — oldest unstarted Phase 2 item, sixth session. The
+  discriminator it was waiting on now exists in `services.py`, but do not
+  copy-paste it: see "What is actually wrong with the subscription view" at the
+  top of this file for why the payoff is smaller than the journal implies and
+  why the `.diag` walk belongs in one shared helper.
+- **`void_invoice` has no code path at all.** Acme's `18` and `19` were voided by
+  hand in the shell on 2026-08-12; the service that would do it properly is still
+  unwritten. Requirements are in "Phase 4 — the two prerequisites", item 2.
 - `InvoicesPay` still does its own `Invoice.objects.get(id=pk, tenant=tenant)`
   before calling `pay_invoice`, which repeats the service's lookup and makes
   `except services.InvoiceNotFound` unreachable. Harmless (both scope by tenant)
