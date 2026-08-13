@@ -22,6 +22,7 @@ services:
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_HOST=db
       - DB_PORT=${DB_PORT}
+      - CELERY_BROKER_URL=redis://redis:6379/0
     ports:
       - 8000:8000
     depends_on:
@@ -36,6 +37,44 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       retries: 5
+
+
+  celery-worker:
+    build: .
+    environment:
+      - DB_ENGINE=${DB_ENGINE}
+      - DB_NAME=${DB_NAME}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=db
+      - DB_PORT=${DB_PORT}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    command: celery -A config worker -l info
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  celery-beat:
+    build: .
+    environment:
+      - DB_ENGINE=${DB_ENGINE}
+      - DB_NAME=${DB_NAME}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=db
+      - DB_PORT=${DB_PORT}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    command: celery -A config beat -l info --schedule=/tmp/celerybeat-schedule
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   db:

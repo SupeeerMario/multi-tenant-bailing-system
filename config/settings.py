@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+from celery.schedules import crontab
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -134,4 +135,14 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ]
+}
+
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
+
+
+CELERY_BEAT_SCHEDULE = {
+    'generate-invoices-every-minute': {
+        'task': 'billing.tasks.generate_invoices_task',
+        'schedule': crontab(minute='*')
+    }
 }
