@@ -1,4 +1,4 @@
-from .models import Subscription, UsageEvent, Invoice, LedgerEntry, IdempotencyKey
+from .models import Subscription, UsageEvent, Invoice, LedgerEntry, IdempotencyKey, Tenant
 from django.db.models import Sum
 from decimal import Decimal, ROUND_HALF_UP
 from django.db import IntegrityError, transaction
@@ -94,6 +94,35 @@ def generate_invoice(tenant):
         raise
     
     return invoice
+
+
+
+
+def generate_invoice_to_all():
+    tenant_collection = Tenant.objects.filter(is_active = True)
+
+    res = []
+    for tenant in tenant_collection:
+
+        try:
+            generated_invoice = generate_invoice(tenant)
+            res.append((tenant.id, 'billed', f'{generated_invoice.id}'))
+
+        except BillingError as e:
+            res.append((tenant.id, 'skipped', f'not billed, billing skipped: {e}'))
+            
+        
+        except Exception as e:
+            res.append((tenant.id, 'errored', f'not billed, billing error: {e}'))
+            
+
+    return res
+        
+
+        
+        
+            
+
 
 
 def mock_payment_gateway(amount, currency, reference):
