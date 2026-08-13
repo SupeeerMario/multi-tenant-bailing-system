@@ -16,9 +16,11 @@ class Command(BaseCommand):
             elif outcome == 'billed':
                 self.stdout.write(f'tenant: {id}, outcome: {outcome}, details: {details}')
 
-        self.stdout.write(self.style.NOTICE('process is finished'))
 
         if sum != 0:
             raise CommandError(f'{sum} tenants errored')
+
+        self.stdout.write(self.style.NOTICE('process is finished'))
+
 
         
