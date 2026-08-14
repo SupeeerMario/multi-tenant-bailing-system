@@ -143,6 +143,6 @@ CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
 CELERY_BEAT_SCHEDULE = {
     'generate-invoices-every-minute': {
         'task': 'billing.tasks.generate_invoices_task',
-        'schedule': crontab(minute='*')
+        'schedule': crontab(minute='*/5')
     }
 }

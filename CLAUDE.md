@@ -11,38 +11,123 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Updated 2026-08-13.
+Updated 2026-08-14.
 
-## FIRST THING NEXT SESSION — Phase 4 step 1, the worker
+## PHASE 4 IS DONE. Next session starts Phase 5.
 
-**Both Phase 4 prerequisites are done.** The `generate_invoice` guard and the
-`except IntegrityError` discriminator landed 2026-08-13 and are verified live;
-what they do and how they were proven is under "History — prerequisite 2" below.
-Nothing is half-built in the working tree.
+**Both halves met, 2026-08-14.** The worker was built and verified 2026-08-13;
+the beat schedule was corrected and the isolation test written and verified
+today. Full record in `docs/journal/phase-4.md` — read "The isolation test" and
+"The beat schedule, corrected" there before writing the next test.
 
-Next, in this order:
+What closed it:
 
-1. **The worker as a management command, no scheduler.**
-   `manage.py generate_invoices` loops every tenant, calls
-   `services.generate_invoice(tenant)`, catches `BillingError` and continues.
-   The service is already shaped for it: it raises rather than returns, the
-   window comes from the subscription, and a tenant that is not due raises
-   `PeriodNotEnded` and is skipped. With the guard in place, a tenant holding an
-   unpaid invoice now raises `OpenInvoiceNotPaid` and is skipped **with a
-   truthful reason in the log**, which is the whole point of having done the
-   prerequisites first.
-2. **Then the schedule.** Undecided: Celery + beat (heavier, real, another
-   compose service) versus a loop container running the command on an interval
-   (trivial, honest for a demo).
-3. **Then the isolation test** — the project's **first test**, so it lands test
-   infrastructure too. Target is `UsageEventListCreateView`; `GET billing/usage/`
-   is the only proven read-isolation path.
+- **The beat schedule.** `config/settings.py:146` now reads
+  `crontab(minute='*/5')`. The old `crontab(minute=5)` meant **once an hour at
+  :05**. Confirmed from beat's own log, not from the source: started `16:52:59`,
+  fired `16:55:00`, a `*/5` boundary. **A settings change does not reach a
+  running beat process** — `docker compose restart celery-beat`.
+- **The isolation test.** `billing/tests.py`,
+  `UsageIsolationTests(APITestCase)`. Two tenants, ORM fixtures, A's key on
+  `GET /billing/usage/` returns exactly A's two events and never B's. Verified
+  in **both** directions: green as written, and red when
+  `billing/views.py:59`'s filter is mutated to `.all()` —
+  `AssertionError: Items in the first set but not the second: 3`, which is B's
+  event id. A green test that has never gone red is not evidence in this
+  project.
 
-Optional and cheap, not blocking: `SubscriptionsCreateView.perform_create`'s bare
-`except IntegrityError` (the oldest unstarted Phase 2 item) can now reuse the
+**`crontab(minute='*/5')` is a demo value, deliberately.** It becomes
+`crontab(hour=0, minute=0)` — daily at midnight UTC — when the project is done.
+Decided 2026-08-14: each subscription carries its own window, so the worker only
+has to catch a window the day it ends, but a five-minute tick is observable in a
+demo and a daily one is not.
+
+### Phase 5 — where to start
+
+The scaffolding now exists, so the remaining two required tests are assertions
+rather than infrastructure. `billing/tests.py` is a single file; split it into a
+package when the third test lands.
+
+1. **Double-pay charges once.** The Phase 3 hero feature and the only one with
+   no automated proof — the evidence today is two curls pasted in
+   `docs/journal/phase-3.md`. Same `Idempotency-Key` twice must return
+   byte-identical bodies and write **one** ledger pair.
+2. **Ledger sums to zero.** And the stronger form:
+   `sum(ACCOUNTS_RECEIVABLE)` equals outstanding `OPEN`. Sum-to-zero alone has
+   passed four separate real bugs in this project — see "The ledger" below.
+3. **CI** — lint + tests + Docker build on push, plus Swagger listing every
+   endpoint.
+
+Cheap additions to the isolation test itself, none blocking: write isolation (a
+POST under A's key attaches to A's subscription — `UsageEventSerializer.
+subscription` is read-only and `perform_create` resolves it from
+`request.tenant`, so a forged `subscription` in the body must be ignored), and
+the 401 paths (no header, unknown key, inactive tenant).
+
+Optional and cheap, still unstarted: `SubscriptionsCreateView.perform_create`'s
+bare `except IntegrityError` (the oldest Phase 2 item) can now reuse the
 discriminator. Read "What is actually wrong with the subscription view" below
 first — the payoff there is smaller than it looks, and copy-pasting the walk into
 `views.py` is the wrong shape.
+
+## History — the worker, done 2026-08-13
+
+Built and verified end to end in one session. **Detail, evidence and the eight
+traps hit along the way are in `docs/journal/phase-4.md`** — read it before
+touching `billing/tasks.py`, the command, or the Celery services. What follows
+is only what shapes future work.
+
+**The loop lives in `services.py`, not in the command.** `generate_invoice_to_all()`
+is a plain function — no `BaseCommand`, no Celery import — because three callers
+want it: the management command, the Celery task, and a test. It **returns** a
+list of `(tenant_id, outcome, detail)` tuples rather than printing; the command
+formats them with `self.stdout.write`, the task with a logger. Decision 2's rule,
+applied again.
+
+**`BillingError` is the skip contract.** Two arms, specific first:
+
+```python
+except BillingError as e:   -> 'skipped'    expected, not due, guarded
+except Exception as e:      -> 'errored'    a real bug
+```
+
+`except X` matches every subclass, so all of `PeriodNotEnded`,
+`OpenInvoiceNotPaid`, `NoActiveSubscription`, `InvoiceAlreadyExists` land in the
+first arm. **`BillingError` is itself an `Exception`, so ordering is
+load-bearing** — the general clause above the specific one makes the specific one
+dead code. And nothing automatic decides a failure is benign: a new expected
+failure raised as a bare `ValueError` gets filed as `errored`. **New expected
+failures must subclass `BillingError`.**
+
+**No `atomic()` around the loop.** Each `generate_invoice` owns its transaction.
+One wrapping block would roll back the invoices already written for earlier
+tenants and poison the connection for every tenant after the first
+`IntegrityError`.
+
+**Only `errored` makes the command exit non-zero** (`CommandError`). `skipped` is
+a normal run — on the current dev database *every* tenant skips, so an exit-1 on
+skips would fire every single time and mean nothing.
+
+**Celery over a loop container**, decided 2026-08-13. The `sleep`-loop container
+was trivial and would have served the demo, but Phase 7 puts two web replicas
+behind nginx and it would have to be deleted then anyway. Redis is the broker,
+no result backend — the worker log is the only trace a run leaves.
+
+**Two rules that outlive the phase:**
+
+- **Exactly one beat container, ever.** The worker scales; beat does not. Two
+  beats is two billing runs per tick.
+- **A double-fire cannot double-bill.** `unique_invoice_period`,
+  `unique_open_invoice_per_tenant` and the guard turn a repeat run into a clean
+  skip. The safety net was built before the thing that needs it, deliberately.
+
+**Verified live**, baseline `4/1/5/4/12` unchanged: the command skipped all four
+tenants with truthful reasons through `call_command`; a forced run with two
+throwaway tenants produced `billed` (invoice 102, ledger `12 -> 14`) and
+`errored` (a patched `TypeError`) and raised `CommandError: 1 tenants errored`;
+and with all five services up, beat sent the due task and the worker executed it
+in 0.103s. **Not proven:** continuation *past* an errored tenant — the broken
+tenant happened to be last in the loop.
 
 ## History — prerequisite 2, done 2026-08-13
 
@@ -228,7 +313,7 @@ What landed, and the evidence for each:
    `0001_initial.py`, which stays untouched.
 
 Phase 4 proper — worker, schedule, isolation test — is listed once at the top of
-this file under "FIRST THING NEXT SESSION". Do not maintain a second copy here.
+this file under "PHASE 4 IS DONE". Do not maintain a second copy here.
 
 ### Dev database baseline — moved 2026-08-12, read this before trusting old numbers
 
@@ -446,8 +531,8 @@ remaining item rather than going along with it.
 | 1 — Data model + skeleton | `docker compose up` starts API + Postgres, migrations create all tables | **Done** (verified 2026-07-30) |
 | 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" in `docs/journal/phase-3.md`. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
-| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **In progress** — **both prerequisites done.** 1 (2026-08-12): serializer `is_active` guard, the `generate_invoice` cancel branch, `DRAFT` dropped. 2 (2026-08-12/13): Acme repaired, `0009` made `unique_invoice_period` skip `VOID` rows, `0010` added `unique_open_invoice_per_tenant`, and 2026-08-13 the `OpenInvoiceNotPaid` guard plus the `except IntegrityError` constraint-name discriminator landed and were verified live. **Worker, schedule and isolation test not started — the worker is the first job next session** |
-| 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | Blocked on 4 |
+| 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **"Done when" met** (verified 2026-08-14). Both prerequisites closed 2026-08-12/13; `generate_invoice_to_all`, the `generate_invoices` command, Redis, Celery worker and beat verified end to end 2026-08-13. 2026-08-14: beat schedule corrected to `crontab(minute='*/5')` and confirmed from beat's log, and `UsageIsolationTests` in `billing/tests.py` proves A's key returns only A's usage events — verified both green and red (mutation of `billing/views.py:59`). Remaining cleanup, not blocking Phase 5: write-isolation and 401 assertions, continuation past an errored tenant |
+| 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | **Next.** Test scaffolding exists as of 2026-08-14, so the two remaining required tests are assertions, not infrastructure: double-pay charges once, ledger sums to zero |
 | 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
 | 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | Blocked on 6 (2026-08-09) |
 
@@ -461,6 +546,7 @@ directly:
 |---|---|
 | `docs/journal/phase-2.md` | Phase 1 verification, `generate_invoice`, all five Phase 2 endpoints, negative money, zero-length periods, ordering, `__str__` |
 | `docs/journal/phase-3.md` | The double-charge repro, the `Idempotency-Key` claim, the two-curl proof, the decline/TTL contract, check ordering |
+| `docs/journal/phase-4.md` | The service loop, the `BillingError` skip contract, the management command, Redis/Celery/beat wiring, the eight traps hit, the end-to-end run, the beat-schedule correction, and the isolation test with its fixture and assertion shape |
 | `docs/journal/phase-7.md` | Horizontal-scale plan, the `migrate`-in-`CMD` blocker |
 
 The "Traps hit, worth not re-learning" lists were deleted on 2026-08-11. The
@@ -565,6 +651,19 @@ ledger write.
   Sibling of the stale-`COPY` trap under Known open items, different mechanism: if a result
   contradicts source you just read, confirm the process reloaded, not just the
   file. `docker compose restart web`.
+- **A wrong string in config is accepted silently — three times in one session
+  (2026-08-13, all Celery).** `CELERY_BROKER_URL` set to the literal string
+  `CELERY_BROKER_URL` was parsed as a *hostname* and fell back to
+  `transport: py-amqp`, so the worker would have retried RabbitMQ forever. The
+  task file named `task.py` instead of `tasks.py` was never imported by
+  `autodiscover_tasks()`, so the task registered nowhere. The beat entry naming
+  `billing.generate_invoices_task`, then `billing.tasks`, published fine while
+  the worker answered `Received unregistered task of type ...` once per tick and
+  beat's own log looked healthy. None of the three raised at startup. **After
+  any config-string change, print what the system resolved it to** —
+  `celery_app.conf.broker_url`, `.connection().transport.driver_name`,
+  `entry['task'] in set(celery_app.tasks)` — do not read the string back and
+  assume.
 - **Plain `Exception` subclasses are invisible to DRF.** `services.BillingError`
   and its subclasses are not `APIException` and not `Http404`, so an uncaught one
   is a **500**, not a 409. Same for `Subscription.DoesNotExist`.
@@ -731,7 +830,32 @@ SQLite, so tests must be run against Postgres to be trustworthy.
 
 The three required tests (Phase 5) map directly to Phase 1 shell checks:
 double-pay charges once, tenant A cannot read or affect tenant B, ledger sums
-to zero.
+to zero. The third is done — `UsageIsolationTests` in `billing/tests.py`,
+2026-08-14.
+
+Settled while writing that first test, and they apply to every test after it:
+
+- **`rest_framework.test.APITestCase`, not `django.test.TestCase`.** The DRF
+  class gives `self.client` an `APIClient` with `.credentials()`, which is how
+  the `Authorization: Api-Key <key>` header gets set. **`APIRequestFactory`
+  builds a request object and never sends it** — fixtures written against it
+  resolve no URL and write no row.
+- **Build fixtures with the ORM, never over HTTP.** Creating them through the
+  endpoints makes every test depend on create-tenant, create-plan and
+  create-subscription, so an unrelated break sends the wrong test red.
+- **A method not named `test_*` is silently not collected.** The run reports
+  `Ran 0 tests / OK` — a pass that proves nothing. Same failure mode as a test
+  with no assertions.
+- **Prove a new test can fail before trusting it.** Mutate the line under test,
+  confirm red, revert. Four real bugs in this project have passed a green
+  invariant; a test that has only ever been green is not yet evidence.
+- **Use `reverse('name')`, not a literal path.** A missing trailing slash is an
+  `APPEND_SLASH` 301, not a 404, and the test client does not follow redirects —
+  the response has no `.data` at all. A renamed path silently returns 0 rows,
+  which reads as perfect isolation.
+- **Assert `status_code` before touching `response.data`.** An error body is a
+  dict, and iterating a dict yields its keys, so the real failure surfaces as a
+  `TypeError` two lines from its cause.
 
 ## Open design decisions
 
