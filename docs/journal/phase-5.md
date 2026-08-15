@@ -1,9 +1,10 @@
 # Phase 5 — tests + docs + CI
 
 Covers the two remaining required tests (double-pay, ledger), the production
-bug the double-pay test found, the fixture mixin, and the Swagger layer with
-its live contract verification. **CI is the only Phase 5 item still open**, and
-the lint ruleset for it is decided below.
+bug the double-pay test found, the fixture mixin, the Swagger layer with its
+live contract verification, and CI. **Phase 5's "Done when" is met as of
+2026-08-15** — CI is green on push across lint, tests and Docker build, and
+Swagger lists every endpoint.
 
 Everything here was verified against Postgres inside the Docker stack. Nothing
 was taken as working because it looked right.
@@ -476,22 +477,262 @@ persists.
 They were kept deliberately. The recorded baseline therefore moves from 4
 tenants to **6**; everything else in it is unchanged.
 
+## CI
+
+Built 2026-08-15, green on push. `.github/workflows/ci.yml`, `on: push`, three
+jobs — `lint`, `test`, `docker-build` — against
+`git@github.com:SupeeerMario/multi-tenant-bailing-system.git`.
+
+Six commits, and the order matters because each one was pushed and read before
+the next was written:
+
+| Commit | What it added |
+|---|---|
+| `fd10750` | ruff `0.16.3` in `requirements.txt`, `pyproject.toml` at the repo root, and the autofix pass it produced |
+| `c99136f` | the workflow file with the `lint` job only |
+| `ab8b3a1` | the `test` job with **no database** — deliberately red |
+| `f423f9e` | the Postgres service, the health check, the six `DB_*` env vars |
+| `21fc638` | the `docker-build` job |
+| `d4555e5` | `runs-on: ubuntu-lateset` → `ubuntu-latest` |
+
+### The lint ruleset, and why it is this narrow
+
+**ruff, `select = ["F", "E9"]` only.** Bug rules — undefined names, unused
+imports, unused variables, f-strings with no placeholders, syntax errors.
+Whitespace and line-length rules are deliberately off: this codebase writes
+keyword arguments as `name = value` throughout, which default PEP 8 rejects as
+`E251`, so a full ruleset would go red on nearly every file on the first run and
+the honest fix would be a reformat pass nobody asked for. Tighten later on
+purpose, not as a side effect of adding CI.
+
+For the record, ruff's own defaults on this tree:
+
+```
+46	RUF012	mutable-class-default
+ 1	BLE001	blind-except
+ 1	I001  	unsorted-imports
+Found 48 errors.
+```
+
+All 46 `RUF012` are `permission_classes = [permissions.IsAuthenticated]` — plain
+DRF. The `BLE001` is the deliberate `except Exception` arm of the skip contract
+in `generate_invoice_to_all`. Not one of the 48 is a bug. Under `["F", "E9"]`
+the same tree answers `All checks passed!`.
+
+### Why a linter at all, demonstrated on this repo's own code
+
+Tests check code that runs. A linter checks code that does not.
+
+`services.py:96-104` — the `except IntegrityError` constraint-name discriminator
+— is executed by **zero** of the four tests. None of them provokes an
+`IntegrityError` inside `generate_invoice`. So a typo in that block cannot be
+caught by the suite. Proven by copying the file to a scratchpad and misspelling
+one name:
+
+```
+F821 Undefined name `tenat`
+   --> services_typo.py:101:50
+    |
+101 |             raise InvoiceAlreadyExists(f"tenant {tenat.id} has already been invoiced ...
+```
+
+Two seconds, nothing executed, and `manage.py test` would still have printed
+`OK`. `E9` covers the same class as the `SyntaxError: 'return' outside function`
+that killed `runserver` while `docker compose ps` still read `Up 2 hours`.
+
+### `pyproject.toml` belongs at the repo root
+
+`ruff init` was run inside `billing/`, which is where the config first landed.
+Ruff resolves configuration **per file**, walking up from each file, so
+`billing/*.py` found that config and `config/*.py` walked to the root, found
+nothing, and fell back to ruff's built-in defaults. Two packages in one repo
+linted by two different rulesets, with nothing reporting it. Moving the file to
+the root fixed it. `target-version` was also `py310` against a `python:3.13-slim`
+Dockerfile; now `py313`.
+
+The `select` line arrived commented out, which is not an empty ruleset — it is
+ruff's defaults, the 48 findings above.
+
+### The test job was built in two pushes, and the first was meant to fail
+
+Push one (`ab8b3a1`) had checkout, setup-python, `pip install -r
+requirements.txt` and `python manage.py test`, and no database at all. It failed
+exactly where it should:
+
+```
+Found 4 test(s).
+Traceback (most recent call last):
+  ...
+  File ".../django/db/backends/base/creation.py", line 206, in _get_test_db_name
+    return TEST_DATABASE_PREFIX + self.connection.settings_dict["NAME"]
+TypeError: can only concatenate str (not "NoneType") to str
+```
+
+Three things were learned from one red run, none of which needed guessing at:
+
+- **`Found 4 test(s).` printed first**, so dependencies installed, Django
+  imported, settings loaded and `billing/tests.py` was collected.
+- **`CELERY_BROKER_URL` unset in CI is harmless.** `config/__init__.py` imports
+  the Celery app on every `manage.py` call, so an import-time problem there would
+  have fired before test discovery. It did not.
+- **The failure is `DB_NAME` being `None`**, not a connection error. All six
+  `DB_*` are `os.getenv` with no default; `NAME` is simply the first one Django
+  touches. The prediction going in was `ImproperlyConfigured` on `ENGINE` — wrong,
+  because Django silently swaps an empty `ENGINE` for the dummy backend rather
+  than raising, and the test runner reads `NAME` before issuing any query.
+
+Django always creates a `test_`-prefixed database rather than using `DB_NAME`
+directly, which is why the crash is a string concatenation and not a connect
+call.
+
+### The service block, and why there are two `env` blocks
+
+`docker-compose.yml` already had this shape and is the clearest way to see it:
+`db` carries `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`, and `web`
+carries `DB_ENGINE` / `DB_NAME` / `DB_HOST` / … Two processes, two vocabularies.
+
+CI is that file with one substitution:
+
+- **`services.postgres.env`** carries `POSTGRES_*` and configures the container
+  at boot — it is what *creates* the database, user and password.
+- **Job-level `env`** carries the six `DB_*` and configures Django — it is how
+  `config/settings.py:86-91` *finds* them.
+
+Nothing links the two automatically. They agree only because the same three
+values are typed twice. Values are throwaway — `billing_ci` / `ci_user` /
+`ci_password` — and written in plaintext on purpose: that database is created
+when the job starts, is reachable only from inside the job, and is destroyed with
+it. GitHub Secrets would be ceremony protecting nothing, and the real `.env`
+values must stay out of a file being pushed.
+
+`POSTGRES_USER` is a superuser in the Postgres image, which is what lets Django
+issue `CREATE DATABASE test_billing_ci`.
+
+**`DB_HOST` is `localhost`, not `db`.** Compose resolves service names over a
+shared network; on a runner the steps execute on the VM itself, not in a
+container, so Postgres is reached through a published port. `ports: - 5432:5432`
+is what publishes it. Copying `DB_HOST=db` across from the compose file is a DNS
+failure.
+
+**`options:` is what makes the runner wait.** Actions has no `depends_on`: it
+always blocks steps until service containers report healthy — but a container
+only *has* a health state if health flags were passed. With no `--health-cmd`
+there is nothing to poll and the steps begin immediately, racing Postgres's
+startup. That is a flaky red, not a reproducible one, which is worse. The string:
+
+```
+--health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+```
+
+The equivalent in the compose file is `healthcheck:` plus `depends_on: db:
+condition: service_healthy` on `web`. Same guarantee, different syntax, and in
+Actions the second half is implicit. The wait is visible in the run log under
+**Initialize containers**, as repeated
+`docker inspect --format="{{.State.Health.Status}}"` until it answers `healthy`.
+Interval 10s × 5 retries gives Postgres about 50 seconds; it normally needs two
+or three.
+
+### The Docker job
+
+Two steps, checkout and `docker build -t multi-tenant-billing .`. No
+setup-python, no service, no env — Docker is preinstalled on the runner.
+
+`docker build` **never executes `CMD`**, so the Dockerfile's `migrate &&
+runserver` chain does not run and no database is required. What the job proves is
+that the image assembles: `requirements.txt` installs, `COPY` paths resolve. What
+it cannot prove is anything about runtime.
+
+The `.` is required. Unlike `ruff check`, which defaults to the current
+directory, Docker has no default context and answers `"docker build" requires
+exactly 1 argument.`
+
+Timing, measured rather than assumed — a local `--no-cache` build:
+
+```
+real	1m2.382s
+```
+
+CI is slower: no layer cache between runs, `--no-cache-dir` in the Dockerfile
+stopping pip reusing wheels within the build, and the `python:3.13-slim` base
+pulled over the network. Three to six minutes is normal. The build context is not
+a factor — `.dockerignore` excludes `.venv/` and `.git/`, leaving 612K (`.git`
+alone is 17M).
+
+### `runs-on: ubuntu-lateset`
+
+The docker job then sat for five minutes doing nothing. Its log header:
+
+```
+Requested labels: ubuntu-lateset
+Waiting for a runner to pick up this job...
+```
+
+**GitHub does not validate runner labels.** An unknown label is not an error —
+it simply matches no runner, so the job queues for 24 hours and then times out.
+No failed step, no message, and from the Actions list it is indistinguishable
+from a slow build. Diagnosis came from opening the queued job and reading its
+header, not from any error.
+
+Fourth instance of "a wrong string in config is accepted silently" in this
+project, after the three Celery ones on 2026-08-13, and the worst-behaved of the
+four.
+
+It also survived a structural parse check, because that check printed key
+*names* and never looked at `runs-on`'s value. The check that would have caught
+it asserts values:
+
+```
+python3 -c "
+import yaml
+d = yaml.safe_load(open('.github/workflows/ci.yml'))
+for n, j in d['jobs'].items():
+    assert j['runs-on'] == 'ubuntu-latest', (n, j['runs-on'])
+print('runs-on OK:', list(d['jobs']))
+"
+```
+
+### YAML traps, all silent or misleading
+
+- **A duplicate top-level `jobs:` key drops the first block entirely.** Two
+  `jobs:` mappings were written, one per job. YAML does not merge them — the
+  second replaces the first, and `lint` vanished with nothing reported. The parse
+  showed `jobs: ['test']`. Detection: the run page must list three jobs.
+- **`services:` is three rungs, not two.** `services:` → a name you choose →
+  `image:` / `env:` / `ports:` / `options:`. Writing `name: postgres` as a field
+  yields `services.name`, not `services.postgres`, and the name key then sits
+  empty as `postgres: null` with its would-be children as siblings.
+- **`env:` is a mapping; `steps:` and `ports:` are lists.** The rule is per key,
+  not per block. `- POSTGRES_DB:` produces a list of one-key mappings with `None`
+  values — which is the same shape as the traceback above, arriving from the
+  other direction.
+- **`- 5432:5432` with no space is the string you want. `- 5432: 5432` with a
+  space is a nested mapping.** Verified both ways:
+  `{'ports': ['5432:5432']}` versus `{'ports': [{5432: 5432}]}`.
+- **`options:` takes a scalar, not a list**, and a value placed on the line after
+  it at the same indent is a parse error — `could not find expected ':'`. Same
+  line, or indented deeper so YAML folds it into the value.
+
+Every one of these was caught locally by parsing the file before pushing, except
+the `runs-on` typo. That is the argument for the check: a malformed workflow
+reaches GitHub as an instant red run with no steps executed, and a *well-formed*
+one with a wrong value reaches it as silence.
+
+### What CI does not cover
+
+Stated so it is not assumed later:
+
+- `docker build` does not run `CMD`, so `migrate` and `runserver` are unexercised.
+- Nothing in CI starts Redis, the Celery worker, or beat. The whole Phase 4
+  scheduling layer is untested by CI and remains verified only by the live run
+  recorded in `phase-4.md`.
+- The lint job's ruleset is narrow by choice. It will not catch a style
+  regression, an unused argument, or a mutable default — only the bug classes in
+  `F` and `E9`.
+
 ## What is left
 
-**CI**, and only CI. Lint + tests + Docker build on push, GitHub Actions
-against `git@github.com:SupeeerMario/multi-tenant-bailing-system.git`.
-
-**Lint ruleset decided 2026-08-15: ruff, `select = ["F", "E9"]` only.** Bug
-rules — undefined names, unused imports, unused variables, f-strings with no
-placeholders, syntax errors. Whitespace and line-length rules are deliberately
-off: this codebase writes keyword arguments as `name = value` throughout, which
-default PEP 8 rejects as `E251`, so a full ruleset would go red on nearly every
-file on the first run and the honest fix would be a reformat pass nobody asked
-for. Tighten later on purpose, not as a side effect of adding CI.
-
-The test job needs a Postgres service and these env vars, all read in
-`config/settings.py`: `DB_ENGINE`, `DB_HOST`, `DB_NAME`, `DB_PASSWORD`,
-`DB_PORT`, `DB_USERNAME`.
+Phase 5's "Done when" is met. The items below were open before CI landed and
+remain open after it; none of them block Phase 6.
 
 ### Cheap, not blocking
 

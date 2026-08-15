@@ -25,6 +25,9 @@ jobs:
       DB_ENGINE: django.db.backends.postgresql
       DB_HOST: localhost
       DB_PORT: 5432
+      SECRET_KEY: not-a-real-secret
+      DEBUG: 'False'
+      ALLOWED_HOSTS: localhost,127.0.0.1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

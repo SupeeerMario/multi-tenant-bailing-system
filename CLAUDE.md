@@ -13,14 +13,15 @@ multi-tenancy + worker, tests + docs, deploy).
 
 Updated 2026-08-15.
 
-## PHASE 5 IS ALL BUT DONE. Only CI is left.
+## PHASE 5 IS DONE. PHASE 6 IS NEXT.
 
-**2026-08-15.** Both remaining required tests landed and Swagger is built and
-verified end to end. Full record in `docs/journal/phase-5.md` — read "The bug
-the double-pay test found" and "Verifying the documented contract against
+**2026-08-15.** Both remaining required tests landed, Swagger is built and
+verified end to end, and CI is green on push across all three jobs. Both halves
+of the "Done when" are met. Full record in `docs/journal/phase-5.md` — read "The
+bug the double-pay test found" and "Verifying the documented contract against
 reality" before touching `pay_invoice` or the schema.
 
-What landed, three commits:
+What landed, three commits plus the CI series:
 
 - **`0965809` — the double-pay test.** `IdempotentPaymentTests` with
   `test_payment_succeeds` and `test_replay_returns_identical_response`. Same
@@ -67,25 +68,104 @@ runs. In autocommit the same block is the outermost one and degrades to a real
 supersedes the old "do not wrap the claim in `atomic()`" note — the test was the
 revisit that note asked for.
 
-### FIRST THING NEXT SESSION — CI
+### CI — built and green 2026-08-15
 
-The only Phase 5 item left. Lint + tests + Docker build on push, GitHub Actions,
-remote is `git@github.com:SupeeerMario/multi-tenant-bailing-system.git`. There is
-no `.github/workflows` and no linter config yet.
+`.github/workflows/ci.yml`, `on: push`, three jobs — `lint`, `test`,
+`docker-build`. Remote is
+`git@github.com:SupeeerMario/multi-tenant-bailing-system.git`. Lint config is
+`pyproject.toml` **at the repo root**.
 
-**Lint ruleset decided 2026-08-15: ruff, `select = ["F", "E9"]` only.** Bug
-rules — undefined names, unused imports, unused variables, f-strings with no
+**Lint ruleset: ruff `0.16.3`, `select = ["F", "E9"]` only.** Bug rules —
+undefined names, unused imports, unused variables, f-strings with no
 placeholders, syntax errors. Whitespace and line-length rules are **deliberately
 off**: this codebase writes keyword arguments as `name = value` everywhere,
 which default PEP 8 rejects as `E251`, so a full ruleset goes red on nearly every
 file and the honest fix is a reformat pass nobody asked for. Tighten later on
-purpose, not as a side effect of adding CI.
+purpose, not as a side effect of adding CI. For the record, ruff's *defaults* on
+this tree report 48 findings — 46 `RUF012` on `permission_classes = [...]`, 1
+`BLE001` on the deliberate `except Exception` skip arm, 1 `I001`. None are bugs.
 
-The test job needs a Postgres service and these env vars, all read in
-`config/settings.py`: `DB_ENGINE`, `DB_HOST`, `DB_NAME`, `DB_PASSWORD`,
-`DB_PORT`, `DB_USERNAME`.
+**The linter earns its place on unreachable code.** `services.py:96-104`, the
+`except IntegrityError` discriminator, is executed by **zero** of the four tests.
+Typo `tenant.id` as `tenat.id` in that block and the suite still prints `OK`;
+ruff answers `F821 Undefined name 'tenat'` in two seconds. Tests check code that
+runs, the linter checks code that does not. `E9` covers the same class as the
+`SyntaxError: 'return' outside function` already in the traps list.
 
-### Cheap and unblocking, if CI lands early
+**`pyproject.toml` must stay at the repo root.** Ruff resolves config per file by
+walking up from it. The `ruff init` boilerplate first landed in `billing/`, which
+left `config/` walking to the root, finding nothing, and falling back to ruff's
+built-in defaults — two packages in one repo linted by different rules, silently.
+
+Six things about the workflow that the YAML does not explain:
+
+- **`lint` installs ruff alone, not `-r requirements.txt`.** Lint imports no
+  Django, so the job stays seconds instead of minutes. Version pinned to
+  `0.16.3` so CI cannot go red because ruff shipped a new rule.
+- **`DB_HOST` is `localhost`, not `db`.** Compose resolves service names on a
+  shared network; Actions steps run on the runner VM and reach Postgres through
+  the published port. Copying `db` across from `docker-compose.yml` is a DNS
+  failure. `ports: - 5432:5432` is what publishes it.
+- **Two `env` blocks, deliberately.** `services.postgres.env` carries
+  `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` and configures the
+  container at boot. Job-level `env` carries the six `DB_*` and configures
+  Django. Two processes, different variable names, linked only by typing the
+  same three values twice. Same split as `db` and `web` in the compose file.
+  Values are throwaway (`billing_ci` / `ci_user` / `ci_password`) and in
+  plaintext on purpose — that database lives for the length of one job and is
+  reachable only from inside it. The real `.env` values stay out.
+- **`options:` is what makes the runner wait.** There is no `depends_on`
+  equivalent: Actions always blocks on service health, but **only if health
+  flags are set**. With no `--health-cmd` the container has no health state,
+  there is nothing to poll, and steps start immediately into a race. The string
+  is `--health-cmd pg_isready --health-interval 10s --health-timeout 5s
+  --health-retries 5`, and it is one **scalar**, not a list.
+- **`ruff check` bare is fine; `docker build` needs the `.`.** Ruff defaults to
+  the current directory. Docker has no default context and answers
+  `"docker build" requires exactly 1 argument.`
+- **The test job went red before it went green.** First push, no DB env:
+  `TypeError: can only concatenate str (not "NoneType") to str` at
+  `TEST_DATABASE_PREFIX + settings_dict["NAME"]`. That failure is the evidence
+  the six env vars are load-bearing — the same standard the tests are held to.
+  It also proved, from `Found 4 test(s).` printing first, that install and
+  imports were fine and that `CELERY_BROKER_URL` being unset in CI is harmless.
+
+**YAML traps hit while writing it**, all silent or misleading:
+
+- **A duplicate top-level `jobs:` key drops the first block entirely.** That is
+  YAML, not GitHub — the second mapping replaces the first. `lint` vanished with
+  nothing reported. Detection: the run page must list **three** jobs.
+- **`services:` is three rungs, not two** — `services:` → a name you choose →
+  `image:`/`env:`/`ports:`/`options:`. Writing `name: postgres` as a *field*
+  produces `services.name`, not `services.postgres`.
+- **`env:` is a mapping, `steps:` and `ports:` are lists.** Per key, not per
+  block. A `- ` on `env` or `options` silently changes the type.
+- **`- 5432:5432` with no space is the string you want; `- 5432: 5432` with a
+  space is a nested mapping.**
+- **A value on the line *after* `options:` at the same indent is a parse error**
+  (`could not find expected ':'`). Same line, or indented deeper.
+
+**Check the file locally before pushing, and assert values, not just structure:**
+
+```
+python3 -c "
+import yaml
+d = yaml.safe_load(open('.github/workflows/ci.yml'))
+for n, j in d['jobs'].items():
+    assert j['runs-on'] == 'ubuntu-latest', (n, j['runs-on'])
+print('runs-on OK:', list(d['jobs']))
+"
+```
+
+That assertion exists because `runs-on: ubuntu-lateset` shipped and cost a
+session — see the config-string trap below. A structural parse check printed the
+key names and never looked at the value.
+
+**What CI does not cover, stated so it is not assumed:** `docker build` never
+executes `CMD`, so `migrate` and `runserver` are unexercised; and nothing in CI
+starts Redis, the Celery worker, or beat.
+
+### Cheap and unblocking, carried into Phase 6
 
 - `TITLE`, `DESCRIPTION`, `VERSION` in `SPECTACULAR_SETTINGS` are still
   defaults, so the docs render as "Swagger" / `0.0.0`.
@@ -603,8 +683,8 @@ remaining item rather than going along with it.
 | 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" in `docs/journal/phase-3.md`. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **"Done when" met** (verified 2026-08-14). Both prerequisites closed 2026-08-12/13; `generate_invoice_to_all`, the `generate_invoices` command, Redis, Celery worker and beat verified end to end 2026-08-13. 2026-08-14: beat schedule corrected to `crontab(minute='*/5')` and confirmed from beat's log, and `UsageIsolationTests` in `billing/tests.py` proves A's key returns only A's usage events — verified both green and red (mutation of `billing/views.py:59`). Remaining cleanup, not blocking Phase 5: write-isolation and 401 assertions, continuation past an errored tenant |
-| 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | **In progress, one item left.** 2026-08-15: all three required tests pass (`0965809` double-pay, `98b9ca5` ledger, isolation from Phase 4), and Swagger lists all 6 routes / 7 operations with auth and the `Idempotency-Key` header documented (`34a88d3`). **CI is the only remaining requirement**; lint ruleset decided (ruff `["F","E9"]`) |
-| 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
+| 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | **"Done when" met** (verified 2026-08-15). All three required tests pass (`0965809` double-pay, `98b9ca5` ledger, isolation from Phase 4); Swagger lists all 6 routes / 7 operations with auth and the `Idempotency-Key` header documented (`34a88d3`); `.github/workflows/ci.yml` green on push with `lint`, `test` and `docker-build`, ruff pinned at `0.16.3` with `select = ["F","E9"]`. Remaining cleanup, not blocking Phase 6: `SPECTACULAR_SETTINGS` `TITLE`/`VERSION`, `401` on the other five endpoints, usage write-isolation test |
+| 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | **Unblocked 2026-08-15, next.** Read "Needed before Phase 6 deploy" under Known open items first — `DEBUG`, `SECRET_KEY`, `ALLOWED_HOSTS`, static files for the Swagger UI, and the `.env` keys a fresh clone needs |
 | 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | Blocked on 6 (2026-08-09) |
 
 ## Build journal — not loaded by default
@@ -618,7 +698,7 @@ directly:
 | `docs/journal/phase-2.md` | Phase 1 verification, `generate_invoice`, all five Phase 2 endpoints, negative money, zero-length periods, ordering, `__str__` |
 | `docs/journal/phase-3.md` | The double-charge repro, the `Idempotency-Key` claim, the two-curl proof, the decline/TTL contract, check ordering |
 | `docs/journal/phase-4.md` | The service loop, the `BillingError` skip contract, the management command, Redis/Celery/beat wiring, the eight traps hit, the end-to-end run, the beat-schedule correction, and the isolation test with its fixture and assertion shape |
-| `docs/journal/phase-5.md` | The double-pay and ledger tests with a mutation proof per assertion, the savepoint bug the double-pay test found, `BillingFixtureMixin` and MRO order, the Swagger wiring, and the live verification of all seven response codes |
+| `docs/journal/phase-5.md` | The double-pay and ledger tests with a mutation proof per assertion, the savepoint bug the double-pay test found, `BillingFixtureMixin` and MRO order, the Swagger wiring, the live verification of all seven response codes, and CI — the six-commit build order, the deliberately-red test job, the two `env` blocks, the health-check wait, the `runs-on` typo, and the YAML traps |
 | `docs/journal/phase-7.md` | Horizontal-scale plan, the `migrate`-in-`CMD` blocker |
 
 The "Traps hit, worth not re-learning" lists were deleted on 2026-08-11. The
@@ -723,8 +803,15 @@ ledger write.
   Sibling of the stale-`COPY` trap under Known open items, different mechanism: if a result
   contradicts source you just read, confirm the process reloaded, not just the
   file. `docker compose restart web`.
-- **A wrong string in config is accepted silently — three times in one session
-  (2026-08-13, all Celery).** `CELERY_BROKER_URL` set to the literal string
+- **A wrong string in config is accepted silently — four instances now, and the
+  newest is the worst-behaved.** `runs-on: ubuntu-lateset` (2026-08-15,
+  `.github/workflows/ci.yml`) matched no runner. **GitHub does not validate
+  runner labels**, so an unknown one is not an error — the job simply sits in
+  `Waiting for a runner to pick up this job...`, queues for 24 hours, then times
+  out. No failed step, no message, and the run reads as a slow build. Diagnosed
+  only by opening the queued job and reading `Requested labels: ubuntu-lateset`
+  in its header. The three from 2026-08-13, all Celery: `CELERY_BROKER_URL` set
+  to the literal string
   `CELERY_BROKER_URL` was parsed as a *hostname* and fell back to
   `transport: py-amqp`, so the worker would have retried RabbitMQ forever. The
   task file named `task.py` instead of `tasks.py` was never imported by
