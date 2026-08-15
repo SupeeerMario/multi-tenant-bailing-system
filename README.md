@@ -191,7 +191,7 @@ curl -X POST 'http://89.168.19.242:8000/billing/invoices/1/pay/' \
 }
 ```
 
-The two responses carry **different `date` headers** — `18:21:25` and `18:22:27` — so the second request genuinely reached the server a minute later. It returned the first request's `paid_at`, because that response was stored and replayed rather than recomputed.
+The two responses carry **different `date` headers** — `18:21:25` and `18:26:22` — so the second request genuinely reached the server five minutes later. It returned the first request's `paid_at`, because that response was stored and replayed rather than recomputed.
 
 Both requests, run against the live instance through Swagger UI:
 
@@ -199,7 +199,7 @@ Both requests, run against the live instance through Swagger UI:
 
 ![First payment request, 200, invoice marked PAID](docs/images/pay-first.png)
 
-**Second request, same key a minute later — the stored response is replayed.**
+**Second request, same key five minutes later — the stored response is replayed.**
 
 ![Replayed payment request, 200, identical body and identical paid_at](docs/images/pay-replay.png)
 
