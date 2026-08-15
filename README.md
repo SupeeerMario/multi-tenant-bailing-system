@@ -193,6 +193,16 @@ curl -X POST 'http://89.168.19.242:8000/billing/invoices/1/pay/' \
 
 The two responses carry **different `date` headers** — `18:21:25` and `18:22:27` — so the second request genuinely reached the server a minute later. It returned the first request's `paid_at`, because that response was stored and replayed rather than recomputed.
 
+Both requests, run against the live instance through Swagger UI:
+
+**First request — the payment actually happens.**
+
+![First payment request, 200, invoice marked PAID](docs/images/pay-first.png)
+
+**Second request, same key a minute later — the stored response is replayed.**
+
+![Replayed payment request, 200, identical body and identical paid_at](docs/images/pay-replay.png)
+
 **The ledger, which is what proves only one charge occurred:**
 
 ```
@@ -285,7 +295,7 @@ Jobs run in parallel and are independent.
 
 ## Deployment
 
-The live instance runs this same `docker-compose.yml` on an Oracle Cloud ARM instance — no separate production compose file, no registry.
+The live instance runs this same `docker-compose.yml` on an Oracle Cloud server — no separate production compose file, no registry.
 
 ```bash
 ssh -i <private-key> ubuntu@<server-ip>
@@ -300,11 +310,4 @@ To ship a change: commit and push locally, then on the server `git pull` and `do
 > [!WARNING]
 > Edit code locally and pull it, never edit on the server. A file changed in one place and not the other produces a deployed app that no longer matches the repository, and the difference is invisible until something breaks.
 
-Two things specific to this host:
-
-- **`ALLOWED_HOSTS` must include the public IP or domain.** Otherwise Django answers `400 Bad Request` with nothing in the body explaining why.
-- **Oracle Cloud blocks the port twice.** Open TCP 8000 in the VCN security list *and* in the instance's own iptables, which rejects everything except SSH by default. Fix the security list first — if the port is still refused after that, the local firewall is the remaining cause.
-
-## Build journal
-
-The phase-by-phase build record — what was built, what was verified live, and why each design call went the way it did — is in [`docs/journal/`](docs/journal/).
+**`ALLOWED_HOSTS` must include the public IP or domain.** Otherwise Django answers `400 Bad Request` with nothing in the body explaining why.
