@@ -3,10 +3,13 @@ from decimal import Decimal
 from dateutil.relativedelta import relativedelta
 from django.db.models import Sum
 from django.utils import timezone
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APIClient, APITransactionTestCase
 
 from . import models, services
 
+import threading
+
+from django.db import connection
 # Create your tests here.
 
 
@@ -141,3 +144,66 @@ class LedgerInvariantTests(BillingFixtureMixin, APITestCase):
 
         self.assertEqual(ledger_total, 0)
         self.assertEqual(ar_total, outstanding)
+
+
+class ConcurrentIdempotencyTests(BillingFixtureMixin, APITransactionTestCase):
+
+    THREADS = 8
+
+    def test_concurrent_same_key_charges_once(self):
+        before_ledger = models.LedgerEntry.objects.filter(tenant = self.tenant).count()
+
+        url = f'/billing/invoices/{self.invoice.id}/pay/'
+        req_body = {'amount': str(self.invoice.amount)}
+        api_key = self.tenant.api_key
+
+        barrier = threading.Barrier(self.THREADS, timeout = 10)
+        lock = threading.Lock()
+        results = []
+        errors = []
+
+        def attempt():
+            client = APIClient()
+            client.credentials(HTTP_AUTHORIZATION = f'Api-Key {api_key}')
+            try:
+                barrier.wait()
+                response = client.post(url, req_body, HTTP_IDEMPOTENCY_KEY = 'race-key')
+                with lock:
+                    results.append((response.status_code, response.content))
+            except Exception as e:
+                with lock:
+                    errors.append(repr(e))
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target = attempt) for _ in range(self.THREADS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout = 30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), self.THREADS)
+
+        successes = [content for code, content in results if code == 200]
+        conflicts = [content for code, content in results if code == 409]
+
+        self.assertEqual(len(successes) + len(conflicts), self.THREADS)
+
+        self.assertGreaterEqual(len(successes), 1)
+
+
+        after_ledger = models.LedgerEntry.objects.filter(tenant = self.tenant).count()
+        self.assertEqual(after_ledger, before_ledger + 2)
+
+        self.assertEqual(len(set(successes)), 1)
+
+        self.assertEqual(
+            models.IdempotencyKey.objects.filter(tenant = self.tenant, key = 'race-key').count(), 1
+        )
+
+        invoice = models.Invoice.objects.get(id = self.invoice.id)
+        self.assertEqual(invoice.status, 'PAID')
+
+        ledger_total = models.LedgerEntry.objects.filter(tenant = self.tenant).aggregate(Sum('amount'))['amount__sum']
+        self.assertEqual(ledger_total, 0)

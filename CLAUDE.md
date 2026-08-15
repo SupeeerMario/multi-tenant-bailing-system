@@ -13,13 +13,114 @@ multi-tenancy + worker, tests + docs, deploy).
 
 Updated 2026-08-15.
 
-## PHASE 5 IS DONE. PHASE 6 IS NEXT.
+## THE PROJECT IS DONE. Phases 1-6 are closed; Phase 7 is the only thing left, and it is optional.
 
-**2026-08-15.** Both remaining required tests landed, Swagger is built and
-verified end to end, and CI is green on push across all three jobs. Both halves
-of the "Done when" are met. Full record in `docs/journal/phase-5.md` — read "The
-bug the double-pay test found" and "Verifying the documented contract against
-reality" before touching `pay_invoice` or the schema.
+**Declared complete by the author on 2026-08-15.** Do not open this file looking
+for the next task — there isn't one unless Phase 7 is picked up deliberately.
+
+**Live:** `http://89.168.19.242:8000/api/docs/` — an Oracle Cloud server running
+this repo's own `docker-compose.yml`. Deployed by SSH, `git clone`, a hand-placed
+`.env`, then `docker compose up -d --build`. No separate production compose file
+and no registry. **Ship changes by committing locally, pushing, then `git pull`
+on the server** — never by editing files on the box, which is how the Dockerfile
+drifted between local and deployed during the deploy session.
+
+### Phase 6, done 2026-08-15 — two of three deliverables, third skipped on purpose
+
+- **Live URL** — up and reachable from outside, verified from a third machine.
+- **README** (`9daf6f7`, `46099e9`, `ebf9a83`) — mermaid architecture diagram,
+  full API walkthrough, the `.env` contract, and the no-double-charge proof
+  captured **against the deployed instance**, with the two Swagger screenshots
+  in `docs/images/`.
+- **Decision note — SKIPPED, deliberately.** The author chose not to write it.
+  Its content is not lost: every decision it would have held is argued out under
+  "Open design decisions" further down this file. **This is a closed question,
+  not an outstanding task.** Do not reopen it or file it as incomplete work.
+
+**The live proof, which supersedes the localhost curls as the project's headline
+evidence.** Two `POST /billing/invoices/1/pay/` with the same
+`Idempotency-Key: dummy_key`, five minutes apart — `date` headers `18:21:25` and
+`18:26:22`, so genuinely two requests — returning **byte-identical** bodies, the
+second carrying the first's `paid_at`. The database afterwards:
+
+```
+ id |       account       |     amount     |            transaction_id            | invoice_id
+  1 | ACCOUNTS_RECEIVABLE |  4647112584.00 | 3f376041-… |  1     invoicing pair
+  2 | REVENUE             | -4647112584.00 | 3f376041-… |  1
+  3 | ACCOUNTS_RECEIVABLE | -4647112584.00 | 1813cadb-… |  1     payment pair
+  4 | CASH                |  4647112584.00 | 1813cadb-… |  1
+```
+
+One payment pair, one `IdempotencyKey` row (`COMPLETED`, `200`), `sum = 0.00`,
+and `AR = outstanding OPEN = 4647112584.00`. **That the invariant matched at a
+non-zero value is the strong form** — `0 == 0` would have passed even with both
+queries broken. Rows 5-6, a second invoice, are the documented one-cycle-per-wake
+catch-up, not a second charge.
+
+### What Phase 6 changed in the app
+
+Four things, all in `f0fadea` and `2c27389`:
+
+- **`SECRET_KEY`, `DEBUG`, `ALLOWED_HOSTS` now come from the environment.**
+  `DEBUG` is a **string comparison**, not a cast — `bool("False")` is `True`, so
+  a cast makes every value truthy and production silently runs in debug.
+  `ALLOWED_HOSTS` filters empties before splitting, because `''.split(',')` is
+  `['']`, a non-empty list holding a host that matches nothing, which also
+  disables Django's `DEBUG=True` localhost fallback.
+- **whitenoise + `STATIC_ROOT`.** Under `DEBUG=False` Django serves no static
+  files, so `/api/docs/` returned `200` while every asset 404'd and the page
+  rendered blank. **WhiteNoise indexes `STATIC_ROOT` once at startup**, so
+  `collectstatic` after boot changes nothing until the process restarts — which
+  is why it runs in the entrypoint, before gunicorn binds.
+- **gunicorn behind `entrypoint.sh`**, replacing `sh -c "migrate && runserver"`.
+  The script ends on **`exec "$@"`**, not a hardcoded gunicorn line: once an
+  `ENTRYPOINT` exists, a Compose `command:` becomes the entrypoint's *arguments*,
+  so hardcoding would have silently turned `celery-worker` and `celery-beat` into
+  web servers. The `exec` is what makes gunicorn PID 1 — `docker compose stop web`
+  now returns in **0.925s** instead of waiting out `SIGKILL`.
+- **`migrate` is its own one-shot Compose service**, with `web` gating on
+  `condition: service_completed_successfully`. Not in the entrypoint, because
+  three containers share that entrypoint and would race each other through
+  migrations on every `up`. Proven on the server's first boot: 28 migrations
+  applied, exit 0, then `web` started.
+
+### Phase 6 traps, all silent
+
+- **`chmod +x` in the Dockerfile cannot reach a bind-mounted file.** `.:/app`
+  overlays the image's `/app` at runtime and carries the **host's** permissions,
+  so the build-time `chmod` is invisible in dev. Image showed `-rwxrwxr-x`, host
+  showed `-rw-rw-r--`, container answered `permission denied`. **Both fixes are
+  needed** — the host bit for dev, the Dockerfile line for production, which has
+  no mount. Same mechanism means anything the build writes to `/app` is hidden in
+  dev, which is why `collectstatic` lives in the entrypoint.
+- **`set -e python manage.py collectstatic --noinput` on one line.** `set` takes
+  trailing words as **positional parameters**, so it discarded the gunicorn
+  command and `exec "$@"` ran collectstatic instead. All three containers exited
+  `0` with nothing in the log looking wrong.
+- **`entrypoint: ['python manage.py migrate']`** — a one-element list. Docker
+  treats element zero as the executable path and does **not** split on spaces.
+  Use separate elements or a plain string.
+- **A missing comma in `MIDDLEWARE`.** `'whitenoise'` newline
+  `'django.contrib.sessions…'` is implicit string concatenation — one entry
+  reading `whitenoisedjango.contrib.…`, whitenoise absent and `SessionMiddleware`
+  eaten. Legal Python, no syntax error, and **`["F", "E9"]` does not catch it**;
+  the rule is `ISC001`. Worth adding `ISC` if the ruleset is ever widened — it is
+  a bug rule, not a style rule.
+- **The `Api-Key` prefix.** Pasting a bare key into Swagger's Authorize box gives
+  `Authentication credentials were not provided.`, because `authenticate.py:16`
+  returns `None` when the first header word does not match. A *wrong key with the
+  right prefix* gives `Tenant not found`. **The two messages tell you which
+  mistake you made.**
+- **gunicorn logs no requests by default.** `runserver` did. Add
+  `--access-logfile -` to the `CMD` — as **two** array elements.
+
+### Phase 5, done 2026-08-15
+
+Both remaining required tests landed, Swagger is built and verified end to end,
+and CI is green on push across all three jobs. Full record in
+`docs/journal/phase-5.md` — read "The bug the double-pay test found" and
+"Verifying the documented contract against reality" before touching `pay_invoice`
+or the schema.
 
 What landed, three commits plus the CI series:
 
@@ -684,8 +785,8 @@ remaining item rather than going along with it.
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" in `docs/journal/phase-3.md`. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **"Done when" met** (verified 2026-08-14). Both prerequisites closed 2026-08-12/13; `generate_invoice_to_all`, the `generate_invoices` command, Redis, Celery worker and beat verified end to end 2026-08-13. 2026-08-14: beat schedule corrected to `crontab(minute='*/5')` and confirmed from beat's log, and `UsageIsolationTests` in `billing/tests.py` proves A's key returns only A's usage events — verified both green and red (mutation of `billing/views.py:59`). Remaining cleanup, not blocking Phase 5: write-isolation and 401 assertions, continuation past an errored tenant |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | **"Done when" met** (verified 2026-08-15). All three required tests pass (`0965809` double-pay, `98b9ca5` ledger, isolation from Phase 4); Swagger lists all 6 routes / 7 operations with auth and the `Idempotency-Key` header documented (`34a88d3`); `.github/workflows/ci.yml` green on push with `lint`, `test` and `docker-build`, ruff pinned at `0.16.3` with `select = ["F","E9"]`. Remaining cleanup, not blocking Phase 6: `SPECTACULAR_SETTINGS` `TITLE`/`VERSION`, `401` on the other five endpoints, usage write-isolation test |
-| 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | **Unblocked 2026-08-15, next.** Read "Needed before Phase 6 deploy" under Known open items first — `DEBUG`, `SECRET_KEY`, `ALLOWED_HOSTS`, static files for the Swagger UI, and the `.env` keys a fresh clone needs |
-| 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | Blocked on 6 (2026-08-09) |
+| 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | **Closed 2026-08-15 on the author's revised terms.** Live at `http://89.168.19.242:8000/api/docs/` on an Oracle Cloud server; README carries the mermaid diagram, the API walkthrough, the `.env` contract and the live no-double-charge proof with screenshots. **The decision note was skipped deliberately** — its content lives under "Open design decisions" in this file. Not an open task |
+| 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | **Unblocked, not started, optional.** Outside the original six-phase spec. Considered for removal 2026-08-15 and kept. Prerequisites are already in place — `migrate` is a one-shot service and gunicorn is PID 1, the two things `phase-7.md` named as blockers |
 
 ## Build journal — not loaded by default
 
@@ -1275,13 +1376,15 @@ them unilaterally.
 ## Known open items
 
 Carried out of Phase 1:
-- Dockerfile `CMD` chains `migrate && runserver` via `sh -c`, so the shell is
-  PID 1 and swallows `SIGTERM`. Fine for dev; Phase 6 wants a real entrypoint
-  script and a WSGI server instead of `runserver`. **Upgraded from cosmetic to
-  blocking by Phase 7** — two web replicas would both run `migrate` on boot
-  against the one database, and Django takes no lock around it. Splitting
-  `migrate` into its own one-shot compose service fixes both problems at once;
-  see `docs/journal/phase-7.md`.
+- ~~Dockerfile `CMD` chains `migrate && runserver` via `sh -c`~~ — **closed
+  2026-08-15.** `ENTRYPOINT ["/app/entrypoint.sh"]` plus
+  `CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000",
+  "--access-logfile", "-"]`, both in JSON array form so Docker adds no shell.
+  The script ends on `exec "$@"`, so gunicorn is PID 1 and `SIGTERM` lands —
+  `docker compose stop web` returns in 0.925s. `migrate` is now its own one-shot
+  Compose service with `web` gating on `service_completed_successfully`. That was
+  named in `docs/journal/phase-7.md` as Phase 7's blocker, so **Phase 7 is no
+  longer blocked by it.**
 - `requirements.txt` lists `dotenv==0.9.9`. Cosmetic only — verified that package
   ships **no Python module**, just `dist-info` metadata declaring a dependency on
   `python-dotenv`. `from dotenv import load_dotenv` already resolves to
@@ -1296,26 +1399,24 @@ Resolved during Phase 2 setup:
   check against a stale image is the worst failure mode in this stack — if a
   result looks impossibly good, confirm the container sees your file first.
 
-Needed before Phase 6 deploy:
-- `config/settings.py` is stock `startproject`: hardcoded `SECRET_KEY`,
-  `DEBUG=True`, empty `ALLOWED_HOSTS`. Docker needs env-var config anyway, so
-  doing it now costs nothing extra.
-- `.env` holds real credentials and is gitignored, but `docker-compose.yml`
-  references it through `${...}` interpolation, so a fresh clone has no database
-  config. Phase 6's README needs to say which keys are required.
-- **Static files, new 2026-08-15 and now load-bearing.** The Swagger UI serves
-  its assets from `/static/drf_spectacular_sidecar/...`, which works today only
-  because `DEBUG=True` makes Django serve static files itself. Under
-  `DEBUG=False` nothing serves them and the docs render **blank** — the exact
-  failure the sidecar was added to prevent, arriving by a different route. Needs
-  `collectstatic` plus whitenoise or nginx, in the same change as the `DEBUG`
-  flip.
-- **Empty `ALLOWED_HOSTS` bit twice on 2026-08-15**, both times as a confusing
-  error rather than an obvious one: `/api/schema/` is unreachable by container
-  hostname (`400 Bad Request`, no explanation in the response), and `APIClient`
-  used outside the test runner is rejected with `DisallowedHost: Invalid
-  HTTP_HOST header: 'testserver'`. The Django test *runner* whitelists
-  `testserver`; a plain script does not.
+Deploy prerequisites — **all closed 2026-08-15**, kept for the mechanisms:
+- ~~`config/settings.py` is stock `startproject`~~ — `SECRET_KEY`, `DEBUG` and
+  `ALLOWED_HOSTS` now read from the environment. `DEBUG` is a **string
+  comparison**, never a cast; `ALLOWED_HOSTS` filters empties before splitting.
+- ~~A fresh clone has no database config~~ — `.env.example` carries all eight
+  keys and the README documents them. `DB_HOST` and `CELERY_BROKER_URL` are
+  deliberately **not** in `.env`: `docker-compose.yml` sets them directly,
+  because they name services on the Compose network.
+- ~~Static files~~ — whitenoise serves them, its middleware **immediately after**
+  `SecurityMiddleware`, `STATIC_ROOT = /app/staticfiles`, `collectstatic` run
+  from `entrypoint.sh` before gunicorn binds. **WhiteNoise indexes `STATIC_ROOT`
+  once at startup**, so collecting after boot changes nothing until a restart.
+- ~~Empty `ALLOWED_HOSTS`~~ — set from the environment, and the deployed server
+  lists its public IP. It bit three times before that: `/api/schema/`
+  unreachable by container hostname (`400`, no explanation), `APIClient` outside
+  the test runner rejected with `DisallowedHost: Invalid HTTP_HOST header:
+  'testserver'`, and the public IP rejected the same way. The Django test
+  *runner* whitelists `testserver`; a plain script does not.
 
 Schema and code cleanups:
 - Invoice period uniqueness is enforced on exact `period_start` / `period_end`
