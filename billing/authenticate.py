@@ -1,7 +1,7 @@
 from rest_framework.authentication import BaseAuthentication, get_authorization_header
 from rest_framework import exceptions
 from .models import Tenant
-
+from drf_spectacular.extensions import OpenApiAuthenticationExtension
 
 class TenantAuthentication(BaseAuthentication):
 
@@ -47,4 +47,16 @@ class TenantAuthentication(BaseAuthentication):
 
     def authenticate_header(self,request):
         return self.keyword
-    
+
+
+class TenantAuthenticationScheme(OpenApiAuthenticationExtension):
+    target_class = 'billing.authenticate.TenantAuthentication'
+    name = 'ApiKeyAuth'
+
+    def get_security_definition(self, auto_schema):
+        return {
+            'type': 'apiKey',
+            'in': 'header',
+            'name': 'Authorization',
+            'description': 'Tenant API key. Paste the whole value including the prefix: Api-Key <your key>',
+        }

@@ -6,7 +6,8 @@ from django.db import IntegrityError
 from django.utils import timezone
 from dateutil.relativedelta import relativedelta
 import hashlib, json
-
+from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
+from drf_spectacular.types import OpenApiTypes
 # Create your views here.
 
 
@@ -29,6 +30,14 @@ class SubscriptionsCreateView(generics.CreateAPIView):
     queryset = models.Subscription.objects.all()
     serializer_class = serializers.SubscriptionsSerializer
 
+
+    @extend_schema(
+        responses = {
+            401: OpenApiResponse(description = 'Missing, malformed or unknown API key, or the tenant is inactive'),
+
+        }
+    )
+    
     def perform_create(self, serializer):
         tenant= self.request.tenant
         period_start = serializer.validated_data['current_period_start']
@@ -45,6 +54,13 @@ class UsageEventListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = serializers.UsageEventSerializer
 
+    @extend_schema(
+        responses = {
+            401: OpenApiResponse(description = 'Missing, malformed or unknown API key, or the tenant is inactive'),
+
+        }
+    )
+
     def perform_create(self, serializer):
         tenant = self.request.tenant
 
@@ -55,6 +71,14 @@ class UsageEventListCreateView(generics.ListCreateAPIView):
 
         serializer.save(subscription = sub)
 
+
+    @extend_schema(
+        responses = {
+            401: OpenApiResponse(description = 'Missing, malformed or unknown API key, or the tenant is inactive'),
+
+        }
+    )
+
     def get_queryset(self):
         return models.UsageEvent.objects.filter(subscription__tenant = self.request.tenant).order_by('occurred_at', 'id')
         
@@ -64,6 +88,12 @@ class InvoiceAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = serializers.InvoiceSerializer
 
+    @extend_schema(
+        responses = {
+            401: OpenApiResponse(description = 'Missing, malformed or unknown API key, or the tenant is inactive'),
+
+        }
+    )
 
     def post(self, request):
 
@@ -93,6 +123,29 @@ class InvoiceAPIView(APIView):
 class InvoicesPay(APIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = serializers.InvoiceSerializer
+
+
+    @extend_schema(
+        parameters = [
+            OpenApiParameter(
+                name = 'Idempotency-Key',
+                type = OpenApiTypes.STR,
+                location = OpenApiParameter.HEADER,
+                required = True,
+                description = 'Unique key per payment attempt. Reusing a key replays the stored response and does not charge again.',
+            )
+        ],
+        request = serializers.PaymentSerializer,
+        responses = {
+            200: serializers.InvoiceSerializer,
+            400: OpenApiResponse(description = 'Amount does not match the invoice, or the Idempotency-Key header is missing or too long'),
+            401: OpenApiResponse(description = 'Missing, malformed or unknown API key, or the tenant is inactive'),
+            402: OpenApiResponse(description = 'Gateway declined. The 402 is stored and replayed byte-identically for the same key.'),
+            404: OpenApiResponse(description = 'No such invoice for this tenant. Another tenant\'s invoice is indistinguishable from one that does not exist.'),
+            409: OpenApiResponse(description = 'Invoice is not OPEN, or a payment with this key is still processing'),
+            422: OpenApiResponse(description = 'This Idempotency-Key was already used with a different request body'),
+        }
+    )
 
     def post(self, request, pk):
         tenant = self.request.tenant
