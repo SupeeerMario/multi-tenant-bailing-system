@@ -142,7 +142,7 @@ REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema'
 }
 
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
 
 
 CELERY_BEAT_SCHEDULE = {
