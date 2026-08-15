@@ -30,7 +30,9 @@ services:
       - 8000:8000
     depends_on:
       db:
-        condition: service_healthy      
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully  
     volumes:
       - .:/app
 
@@ -84,6 +86,28 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+
+  migrate:
+    build: .
+    environment:
+      - DB_ENGINE=${DB_ENGINE}
+      - DB_NAME=${DB_NAME}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=db
+      - DB_PORT=${DB_PORT}
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS}
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    entrypoint: python manage.py migrate
+    depends_on:
+      db:
+        condition: service_healthy     
+    volumes:
+      - .:/app
+
 
 volumes:
   db:
