@@ -2,8 +2,35 @@ from rest_framework.test import APITestCase
 from . import models, services
 from django.utils import timezone
 from dateutil.relativedelta import relativedelta
+from django.db.models import Sum
+from decimal import Decimal
+
 # Create your tests here.
 
+
+class BillingFixtureMixin:
+    def setUp(self):
+        super().setUp()
+
+        self.tenant = models.Tenant.objects.create(name = 'test-tenant')
+
+        self.plan = models.Plan.objects.create(
+            name = 'test-plan',
+            base_fee = 20,
+            unit_fee = 1,
+            currency = 'USD'
+        )
+
+        current_period_start = timezone.now() - relativedelta (months=2)
+        current_period_end = timezone.now() - relativedelta (months=1)
+        self.tenant_subscription = models.Subscription.objects.create(tenant = self.tenant, plan = self.plan, current_period_start = current_period_start, current_period_end = current_period_end)
+
+        self.client.credentials(HTTP_AUTHORIZATION = f'Api-Key {self.tenant.api_key}')
+
+        self.invoice = services.generate_invoice(self.tenant)
+
+
+        
 
 class UsageIsolationTests(APITestCase):
     def test_isolation(self):
@@ -38,25 +65,7 @@ class UsageIsolationTests(APITestCase):
         self.assertNotIn(tenant_B_first_usageevent.id, return_ids)
 
 
-class IdempotentPaymentTests(APITestCase):
-    def setUp(self):
-        self.tenant = models.Tenant.objects.create(name = 'test-tenant')
-
-        self.plan = models.Plan.objects.create(
-            name = 'test-plan',
-            base_fee = 20,
-            unit_fee = 1,
-            currency = 'USD'
-        )
-
-        current_period_start = timezone.now() - relativedelta (months=2)
-        current_period_end = timezone.now() - relativedelta (months=1)
-        self.tenant_subscription = models.Subscription.objects.create(tenant = self.tenant, plan = self.plan, current_period_start = current_period_start, current_period_end = current_period_end)
-
-        self.client.credentials(HTTP_AUTHORIZATION = f'Api-Key {self.tenant.api_key}')
-
-        self.invoice = services.generate_invoice(self.tenant)
-        
+class IdempotentPaymentTests(BillingFixtureMixin, APITestCase):
 
     def test_payment_succeeds(self):
         before_count = models.LedgerEntry.objects.filter(tenant = self.tenant).count()
@@ -98,3 +107,35 @@ class IdempotentPaymentTests(APITestCase):
         after_count = models.LedgerEntry.objects.filter(tenant = self.tenant).count()
         self.assertEqual(after_count, before_count + 2)
         self.assertEqual(models.IdempotencyKey.objects.filter(tenant = self.tenant).count(), 1)
+
+
+class LedgerInvariantTests(BillingFixtureMixin, APITestCase):
+
+    def test_ledger_invariants_hold_before_and_after_payment(self):
+        ledger_total = models.LedgerEntry.objects.filter(tenant = self.tenant).aggregate(Sum('amount'))['amount__sum']
+        ar_total = models.LedgerEntry.objects.filter(tenant = self.tenant, account = 'ACCOUNTS_RECEIVABLE').aggregate(Sum('amount'))['amount__sum']
+        outstanding = models.Invoice.objects.filter(tenant = self.tenant, status = 'OPEN').aggregate(Sum('amount'))['amount__sum']
+
+        self.assertEqual(ledger_total, 0)
+        self.assertEqual(ar_total, outstanding)
+
+        req_body = {
+            'amount': str(self.invoice.amount)
+        }
+
+        response = self.client.post(f'/billing/invoices/{self.invoice.id}/pay/', req_body, HTTP_IDEMPOTENCY_KEY = 'test-key-1')
+        self.assertEqual(response.status_code, 200)
+
+        invoice = models.Invoice.objects.get(tenant = self.tenant, id = self.invoice.id)
+        self.assertEqual(invoice.status, 'PAID')
+
+
+        ledger_total = models.LedgerEntry.objects.filter(tenant = self.tenant).aggregate(Sum('amount'))['amount__sum']
+        ar_total = models.LedgerEntry.objects.filter(tenant = self.tenant, account = 'ACCOUNTS_RECEIVABLE').aggregate(Sum('amount'))['amount__sum']
+        outstanding = models.Invoice.objects.filter(tenant = self.tenant, status = 'OPEN').aggregate(Sum('amount'))['amount__sum']
+
+        if outstanding is None:
+            outstanding = Decimal('0')
+
+        self.assertEqual(ledger_total, 0)
+        self.assertEqual(ar_total, outstanding)
