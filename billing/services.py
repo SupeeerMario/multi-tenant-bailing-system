@@ -164,7 +164,8 @@ def pay_invoice(tenant, invoice_id, amount, idempotency_key, request_hash):
 
 
     try:
-        idem_key_object = IdempotencyKey.objects.create(tenant = tenant, key = idempotency_key, request_hash = request_hash, state = 'PROCESSING')
+        with transaction.atomic():
+            idem_key_object = IdempotencyKey.objects.create(tenant = tenant, key = idempotency_key, request_hash = request_hash, state = 'PROCESSING')
     except IntegrityError:
         exist = IdempotencyKey.objects.get(tenant = tenant, key = idempotency_key)
 

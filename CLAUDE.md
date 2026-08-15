@@ -42,21 +42,70 @@ Decided 2026-08-14: each subscription carries its own window, so the worker only
 has to catch a window the day it ends, but a five-minute tick is observable in a
 demo and a daily one is not.
 
-### Phase 5 — where to start
+### FIRST THING NEXT SESSION — the double-pay test
 
-The scaffolding now exists, so the remaining two required tests are assertions
-rather than infrastructure. `billing/tests.py` is a single file; split it into a
-package when the third test lands.
+Phase 5 order is: double-pay test, ledger test, Swagger, CI. CI last, because it
+only runs whatever already exists.
 
-1. **Double-pay charges once.** The Phase 3 hero feature and the only one with
-   no automated proof — the evidence today is two curls pasted in
-   `docs/journal/phase-3.md`. Same `Idempotency-Key` twice must return
-   byte-identical bodies and write **one** ledger pair.
-2. **Ledger sums to zero.** And the stronger form:
-   `sum(ACCOUNTS_RECEIVABLE)` equals outstanding `OPEN`. Sum-to-zero alone has
-   passed four separate real bugs in this project — see "The ledger" below.
-3. **CI** — lint + tests + Docker build on push, plus Swagger listing every
-   endpoint.
+**Start with double-pay.** It is the hero feature and the only one with no
+automated proof — today's evidence is two curls pasted in
+`docs/journal/phase-3.md`. Same `Idempotency-Key` twice must return
+byte-identical bodies and write **one** ledger pair.
+
+New class `IdempotentPaymentTests(APITestCase)` in `billing/tests.py`. The file
+stays a single module until the ledger test lands, then split it into a package.
+
+**Decided 2026-08-14: build the starting state by calling
+`services.generate_invoice(tenant)`, not by hand-writing the invoice and its
+ledger rows.** This deliberately breaks the fixtures-via-ORM-only rule the
+isolation test follows, and the reason is narrow: the thing under test is the
+*delta* a payment causes, so hand-building the `ACCOUNTS_RECEIVABLE`/`REVENUE`
+pair means writing by hand the exact rows the test then asserts about — the test
+would agree with itself. The cost is real and accepted: this test also goes red
+if invoice *generation* breaks.
+
+Consequences for the fixtures, all three of which will otherwise raise:
+
+- `generate_invoice(tenant)` takes **only** the tenant (`billing/services.py:38`)
+  and reads the window off the subscription.
+- The window runs **backwards** — `current_period_end` must be in the past or
+  `PeriodNotEnded` fires. `now - 2 months` to `now - 1 month`. This is the
+  opposite of the isolation fixtures.
+- The tenant must hold no `OPEN` invoice (`OpenInvoiceNotPaid`) and must have an
+  `ACTIVE` subscription (`NoActiveSubscription`).
+
+**The mock gateway is deterministic** (`billing/services.py:128-148`) — it
+declines only on an unsupported currency, an empty reference, or an amount of
+exactly `Decimal('66.66')`. No randomness, so nothing flakes. Keep the fixture
+amount away from `66.66`, and remember that value: it is a free decline test,
+and the decline path is the one that must *store and replay* its 402.
+
+Request shape:
+
+```python
+url = reverse('pay_invoice', args=[invoice.id])
+response = self.client.post(url, {'amount': str(invoice.amount)},
+                            HTTP_IDEMPOTENCY_KEY = 'test-key-1')
+```
+
+`amount` must equal `invoice.amount` exactly or `AmountMismatch` fires
+(`services.py:162`). `HTTP_IDEMPOTENCY_KEY` is how the test client spells the
+header the view reads at `views.py:100`; a missing one is a hard reject.
+
+First pass asserts a single successful payment: `200`, the invoice is `PAID`
+**re-fetched from the database** (the local object is a stale copy the service
+never touched — this exact bug is in the traps list), and `LedgerEntry` count
+grew by exactly 2. Capture the count *before* the POST so it is a delta, not a
+total. Then add the replay.
+
+Afterwards:
+
+1. **Ledger sums to zero**, plus the stronger form: `sum(ACCOUNTS_RECEIVABLE)`
+   equals outstanding `OPEN`. Sum-to-zero alone has passed four separate real
+   bugs in this project — see "The ledger" below.
+2. **Swagger** listing every endpoint (`drf-spectacular`, a new dependency —
+   needs `docker compose up -d --build`, a restart will not install it).
+3. **CI** — lint + tests + Docker build on push.
 
 Cheap additions to the isolation test itself, none blocking: write isolation (a
 POST under A's key attaches to A's subscription — `UsageEventSerializer.
