@@ -249,6 +249,8 @@ Correctness rests on a database constraint, not a Python check. Two concurrent r
 
 A repeated key carrying a *different* request body is a client error (`422`), not a replay.
 
+That constraint is load-bearing rather than defensive, and there is a test that shows it: `ConcurrentIdempotencyTests` fires eight simultaneous payments at one invoice with one key and asserts a single ledger pair. Remove the index and the same test records eight charges. See [The concurrency test](#the-concurrency-test).
+
 Keys are scoped per tenant, so the same key string under two different tenants is legal and never collides.
 
 ## Background worker
@@ -273,15 +275,44 @@ Run exactly one beat container. The worker scales; beat does not, and two beats 
 docker compose exec web python manage.py test
 ```
 
-Four tests, run against Postgres rather than SQLite — the transaction semantics this project relies on differ between them.
+Five tests, run against Postgres rather than SQLite — the transaction semantics this project relies on differ between them.
 
 | Test | Asserts |
 | --- | --- |
 | `UsageIsolationTests` | Tenant A's key returns exactly A's usage events and never B's |
 | `IdempotentPaymentTests` | A replayed key returns byte-identical content and writes no second ledger pair |
 | `LedgerInvariantTests` | `sum(all) == 0` **and** `sum(AR) == outstanding OPEN`, before and after payment |
+| `ConcurrentIdempotencyTests` | 8 threads racing one key write exactly one ledger pair and one key row |
 
 Every assertion was proven able to fail by mutating the code under test before being trusted.
+
+### The concurrency test
+
+`ConcurrentIdempotencyTests` is the only one that cannot use `APITestCase`. That class holds every fixture in a single uncommitted transaction on the main connection, and the threads open connections of their own — they would see no tenant, no plan and no invoice, and the test would pass for entirely the wrong reason. It uses `APITransactionTestCase`, which commits for real.
+
+Eight threads are released together by a `threading.Barrier` so they collide instead of running in sequence. Each gets its own `APIClient` and closes its connection in a `finally`; exceptions are collected rather than raised, because a raise inside a thread is swallowed and the suite would go green with eight dead threads.
+
+Both outcomes are accepted, because both are correct. The loser's `INSERT` blocks on the unique index until the winner commits its claim, then reads the row back: if the winner is still in the gateway the answer is `409 payment already processing`, and if it has finished the answer is the stored `200`, replayed.
+
+```
+status codes: [200, 200, 409, 409, 409, 409, 409, 409]
+ledger rows: 2 -> 4
+idempotency key rows: 1
+```
+
+Dropped `unique_key_per_tenant` in a throwaway migration and reran, same test:
+
+```
+status codes: [200, 200, 200, 200, 200, 200, 200, 200]
+ledger rows: 2 -> 18
+idempotency key rows: 8
+AssertionError: 18 != 4
+```
+
+Eight claims, eight charges, eight payment pairs — 160.00 taken for a 20.00 invoice. Across two such runs the `invoice.status != 'OPEN'` check caught one of the eight threads and then none of them, which is the point: the Python check is a coincidence of scheduling. Only the unique index is deterministic.
+
+> [!NOTE]
+> The ledger-count assertion is deliberately placed **above** the byte-identity one. With the original ordering the constraint-drop run failed on "7 != 1" — distinct response bodies — and never reached the assertion about the money.
 
 ## CI
 
