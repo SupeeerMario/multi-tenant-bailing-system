@@ -1,5 +1,7 @@
 from django.core.management.base import BaseCommand, CommandError
+
 from ... import services
+
 
 class Command(BaseCommand):
     def handle(self, *args, **options):
@@ -11,9 +13,7 @@ class Command(BaseCommand):
             if outcome == 'errored':
                 sum += 1
                 self.stdout.write(self.style.ERROR_OUTPUT(f'tenant: {id}, outcome: {outcome}, details: {details}'))
-            elif outcome == 'skipped':
-                self.stdout.write(f'tenant: {id}, outcome: {outcome}, details: {details}')
-            elif outcome == 'billed':
+            elif outcome == 'skipped' or outcome == 'billed':
                 self.stdout.write(f'tenant: {id}, outcome: {outcome}, details: {details}')
 
 

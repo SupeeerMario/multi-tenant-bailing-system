@@ -1,8 +1,9 @@
-from django.db import models
-from django.db.models import Q, F
-import uuid
 import secrets
+import uuid
+
 from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.models import F, Q
 
 # Create your models here.
 

@@ -1,9 +1,11 @@
-from rest_framework.test import APITestCase
-from . import models, services
-from django.utils import timezone
+from decimal import Decimal
+
 from dateutil.relativedelta import relativedelta
 from django.db.models import Sum
-from decimal import Decimal
+from django.utils import timezone
+from rest_framework.test import APITestCase
+
+from . import models, services
 
 # Create your tests here.
 
@@ -135,7 +137,7 @@ class LedgerInvariantTests(BillingFixtureMixin, APITestCase):
         outstanding = models.Invoice.objects.filter(tenant = self.tenant, status = 'OPEN').aggregate(Sum('amount'))['amount__sum']
 
         if outstanding is None:
-            outstanding = Decimal('0')
+            outstanding = Decimal(0)
 
         self.assertEqual(ledger_total, 0)
         self.assertEqual(ar_total, outstanding)

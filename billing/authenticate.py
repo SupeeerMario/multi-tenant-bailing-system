@@ -1,7 +1,9 @@
-from rest_framework.authentication import BaseAuthentication, get_authorization_header
-from rest_framework import exceptions
-from .models import Tenant
 from drf_spectacular.extensions import OpenApiAuthenticationExtension
+from rest_framework import exceptions
+from rest_framework.authentication import BaseAuthentication, get_authorization_header
+
+from .models import Tenant
+
 
 class TenantAuthentication(BaseAuthentication):
 

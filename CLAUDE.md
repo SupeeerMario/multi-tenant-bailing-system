@@ -11,30 +11,112 @@ multi-tenancy + worker, tests + docs, deploy).
 
 ## Start here next session
 
-Updated 2026-08-14.
+Updated 2026-08-15.
 
-## PHASE 4 IS DONE. Next session starts Phase 5.
+## PHASE 5 IS ALL BUT DONE. Only CI is left.
 
-**Both halves met, 2026-08-14.** The worker was built and verified 2026-08-13;
-the beat schedule was corrected and the isolation test written and verified
-today. Full record in `docs/journal/phase-4.md` — read "The isolation test" and
-"The beat schedule, corrected" there before writing the next test.
+**2026-08-15.** Both remaining required tests landed and Swagger is built and
+verified end to end. Full record in `docs/journal/phase-5.md` — read "The bug
+the double-pay test found" and "Verifying the documented contract against
+reality" before touching `pay_invoice` or the schema.
 
-What closed it:
+What landed, three commits:
 
-- **The beat schedule.** `config/settings.py:146` now reads
-  `crontab(minute='*/5')`. The old `crontab(minute=5)` meant **once an hour at
-  :05**. Confirmed from beat's own log, not from the source: started `16:52:59`,
-  fired `16:55:00`, a `*/5` boundary. **A settings change does not reach a
-  running beat process** — `docker compose restart celery-beat`.
-- **The isolation test.** `billing/tests.py`,
-  `UsageIsolationTests(APITestCase)`. Two tenants, ORM fixtures, A's key on
-  `GET /billing/usage/` returns exactly A's two events and never B's. Verified
-  in **both** directions: green as written, and red when
-  `billing/views.py:59`'s filter is mutated to `.all()` —
-  `AssertionError: Items in the first set but not the second: 3`, which is B's
-  event id. A green test that has never gone red is not evidence in this
-  project.
+- **`0965809` — the double-pay test.** `IdempotentPaymentTests` with
+  `test_payment_succeeds` and `test_replay_returns_identical_response`. Same
+  `Idempotency-Key` twice returns **byte-identical** `response.content` and
+  writes **no** second ledger pair. The Phase 3 deliverable is no longer two
+  curls in a journal.
+- **`98b9ca5` — the ledger test.** `LedgerInvariantTests`, asserting both
+  `sum(all) == 0` **and** `sum(ACCOUNTS_RECEIVABLE) == outstanding OPEN`, once
+  before the payment and again after. Plus `BillingFixtureMixin`, which both
+  payment classes share.
+- **`34a88d3` — Swagger.** `drf-spectacular` + sidecar, `/api/schema/` and
+  `/api/docs/`, an `OpenApiAuthenticationExtension` so the Authorize button
+  works, and `@extend_schema` on `InvoicesPay.post`.
+
+Every assertion but one was **proven able to fail** by mutating the code under
+test. The exception is recorded as unproven on purpose: any mutation that
+writes a second `IdempotencyKey` row also changes the status code, so the
+earlier assertion fires first and the key-count check is never reached.
+
+### The production bug the double-pay test found — read this before touching `pay_invoice`
+
+`services.py:166-170` now wraps the idempotency claim `INSERT` in its own
+`transaction.atomic()`, with `except IntegrityError` **outside** the `with`:
+
+```python
+try:
+    with transaction.atomic():
+        idem_key_object = IdempotencyKey.objects.create(...)
+except IntegrityError:
+    exist = IdempotencyKey.objects.get(...)
+```
+
+The `get()` in that `except` only ever worked under autocommit. Postgres marks
+the **whole transaction** aborted on any `IntegrityError` and refuses every
+later statement, so under `django.test.TestCase` — which wraps each test method
+in one `atomic()` block — the replay raised `TransactionManagementError`. The
+inner block emits a `SAVEPOINT` and the exception leaving it emits
+`ROLLBACK TO SAVEPOINT`, which clears the aborted state before the `except` body
+runs. In autocommit the same block is the outermost one and degrades to a real
+`BEGIN`/`ROLLBACK`, so production behaviour is unchanged.
+
+**The `except` must stay outside the `with`.** The rewind is emitted by
+`atomic.__exit__`; catch the exception inside and `__exit__` never fires. This
+supersedes the old "do not wrap the claim in `atomic()`" note — the test was the
+revisit that note asked for.
+
+### FIRST THING NEXT SESSION — CI
+
+The only Phase 5 item left. Lint + tests + Docker build on push, GitHub Actions,
+remote is `git@github.com:SupeeerMario/multi-tenant-bailing-system.git`. There is
+no `.github/workflows` and no linter config yet.
+
+**Lint ruleset decided 2026-08-15: ruff, `select = ["F", "E9"]` only.** Bug
+rules — undefined names, unused imports, unused variables, f-strings with no
+placeholders, syntax errors. Whitespace and line-length rules are **deliberately
+off**: this codebase writes keyword arguments as `name = value` everywhere,
+which default PEP 8 rejects as `E251`, so a full ruleset goes red on nearly every
+file and the honest fix is a reformat pass nobody asked for. Tighten later on
+purpose, not as a side effect of adding CI.
+
+The test job needs a Postgres service and these env vars, all read in
+`config/settings.py`: `DB_ENGINE`, `DB_HOST`, `DB_NAME`, `DB_PASSWORD`,
+`DB_PORT`, `DB_USERNAME`.
+
+### Cheap and unblocking, if CI lands early
+
+- `TITLE`, `DESCRIPTION`, `VERSION` in `SPECTACULAR_SETTINGS` are still
+  defaults, so the docs render as "Swagger" / `0.0.0`.
+- The other five endpoints document no `401`. The security scheme is declared
+  globally so a reader can infer it, but `pay` is the only one documented
+  properly.
+- Write isolation on the usage endpoint (a POST under A's key must attach to A's
+  subscription — `UsageEventSerializer.subscription` is read-only and
+  `perform_create` resolves it from `request.tenant`, so a forged `subscription`
+  in the body must be ignored), and the 401 paths.
+- `SubscriptionsCreateView.perform_create`'s bare `except IntegrityError`, the
+  oldest Phase 2 item. Read "What is actually wrong with the subscription view"
+  below first — the payoff is smaller than it looks and copy-pasting the `.diag`
+  walk into `views.py` is the wrong shape.
+
+## History — Phase 4, done 2026-08-14
+
+**Both halves met.** The worker was built and verified 2026-08-13; the beat
+schedule was corrected and the isolation test written and verified 2026-08-14.
+Full record in `docs/journal/phase-4.md`.
+
+- **The beat schedule.** `config/settings.py:149` reads `crontab(minute='*/5')`.
+  The old `crontab(minute=5)` meant **once an hour at :05**. Confirmed from
+  beat's own log, not from the source: started `16:52:59`, fired `16:55:00`, a
+  `*/5` boundary. **A settings change does not reach a running beat process** —
+  `docker compose restart celery-beat`.
+- **The isolation test.** `UsageIsolationTests(APITestCase)`. Two tenants, ORM
+  fixtures, A's key on `GET /billing/usage/` returns exactly A's two events and
+  never B's. Verified in **both** directions: green as written, and red when
+  `billing/views.py:59`'s filter is mutated to `.all()`. A green test that has
+  never gone red is not evidence in this project.
 
 **`crontab(minute='*/5')` is a demo value, deliberately.** It becomes
 `crontab(hour=0, minute=0)` — daily at midnight UTC — when the project is done.
@@ -42,82 +124,11 @@ Decided 2026-08-14: each subscription carries its own window, so the worker only
 has to catch a window the day it ends, but a five-minute tick is observable in a
 demo and a daily one is not.
 
-### FIRST THING NEXT SESSION — the double-pay test
-
-Phase 5 order is: double-pay test, ledger test, Swagger, CI. CI last, because it
-only runs whatever already exists.
-
-**Start with double-pay.** It is the hero feature and the only one with no
-automated proof — today's evidence is two curls pasted in
-`docs/journal/phase-3.md`. Same `Idempotency-Key` twice must return
-byte-identical bodies and write **one** ledger pair.
-
-New class `IdempotentPaymentTests(APITestCase)` in `billing/tests.py`. The file
-stays a single module until the ledger test lands, then split it into a package.
-
-**Decided 2026-08-14: build the starting state by calling
-`services.generate_invoice(tenant)`, not by hand-writing the invoice and its
-ledger rows.** This deliberately breaks the fixtures-via-ORM-only rule the
-isolation test follows, and the reason is narrow: the thing under test is the
-*delta* a payment causes, so hand-building the `ACCOUNTS_RECEIVABLE`/`REVENUE`
-pair means writing by hand the exact rows the test then asserts about — the test
-would agree with itself. The cost is real and accepted: this test also goes red
-if invoice *generation* breaks.
-
-Consequences for the fixtures, all three of which will otherwise raise:
-
-- `generate_invoice(tenant)` takes **only** the tenant (`billing/services.py:38`)
-  and reads the window off the subscription.
-- The window runs **backwards** — `current_period_end` must be in the past or
-  `PeriodNotEnded` fires. `now - 2 months` to `now - 1 month`. This is the
-  opposite of the isolation fixtures.
-- The tenant must hold no `OPEN` invoice (`OpenInvoiceNotPaid`) and must have an
-  `ACTIVE` subscription (`NoActiveSubscription`).
-
 **The mock gateway is deterministic** (`billing/services.py:128-148`) — it
 declines only on an unsupported currency, an empty reference, or an amount of
-exactly `Decimal('66.66')`. No randomness, so nothing flakes. Keep the fixture
-amount away from `66.66`, and remember that value: it is a free decline test,
+exactly `Decimal('66.66')`. No randomness, so nothing flakes. Keep fixture
+amounts away from `66.66`, and remember that value: it is a free decline test,
 and the decline path is the one that must *store and replay* its 402.
-
-Request shape:
-
-```python
-url = reverse('pay_invoice', args=[invoice.id])
-response = self.client.post(url, {'amount': str(invoice.amount)},
-                            HTTP_IDEMPOTENCY_KEY = 'test-key-1')
-```
-
-`amount` must equal `invoice.amount` exactly or `AmountMismatch` fires
-(`services.py:162`). `HTTP_IDEMPOTENCY_KEY` is how the test client spells the
-header the view reads at `views.py:100`; a missing one is a hard reject.
-
-First pass asserts a single successful payment: `200`, the invoice is `PAID`
-**re-fetched from the database** (the local object is a stale copy the service
-never touched — this exact bug is in the traps list), and `LedgerEntry` count
-grew by exactly 2. Capture the count *before* the POST so it is a delta, not a
-total. Then add the replay.
-
-Afterwards:
-
-1. **Ledger sums to zero**, plus the stronger form: `sum(ACCOUNTS_RECEIVABLE)`
-   equals outstanding `OPEN`. Sum-to-zero alone has passed four separate real
-   bugs in this project — see "The ledger" below.
-2. **Swagger** listing every endpoint (`drf-spectacular`, a new dependency —
-   needs `docker compose up -d --build`, a restart will not install it).
-3. **CI** — lint + tests + Docker build on push.
-
-Cheap additions to the isolation test itself, none blocking: write isolation (a
-POST under A's key attaches to A's subscription — `UsageEventSerializer.
-subscription` is read-only and `perform_create` resolves it from
-`request.tenant`, so a forged `subscription` in the body must be ignored), and
-the 401 paths (no header, unknown key, inactive tenant).
-
-Optional and cheap, still unstarted: `SubscriptionsCreateView.perform_create`'s
-bare `except IntegrityError` (the oldest Phase 2 item) can now reuse the
-discriminator. Read "What is actually wrong with the subscription view" below
-first — the payoff there is smaller than it looks, and copy-pasting the walk into
-`views.py` is the wrong shape.
 
 ## History — the worker, done 2026-08-13
 
@@ -361,8 +372,9 @@ What landed, and the evidence for each:
    `showmigrations` reads `[X] 0008`. Grep confirms no `DRAFT` outside
    `0001_initial.py`, which stays untouched.
 
-Phase 4 proper — worker, schedule, isolation test — is listed once at the top of
-this file under "PHASE 4 IS DONE". Do not maintain a second copy here.
+Phase 4 proper — worker, schedule, isolation test — is summarised once under
+"History — Phase 4, done 2026-08-14" near the top of this file. Do not maintain
+a second copy here.
 
 ### Dev database baseline — moved 2026-08-12, read this before trusting old numbers
 
@@ -400,10 +412,10 @@ The repair, run 2026-08-12 in one `transaction.atomic()`, by hand in the shell �
 - Subscription `8` advanced to `Aug 1 -> Sep 1`, past what invoice `17`
   legitimately covers.
 
-**New baseline, verified 2026-08-12:**
+**New baseline, verified 2026-08-12, tenant count amended 2026-08-15:**
 
 ```
-4 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices / 12 ledger rows
+6 tenants / 1 plan / 5 subscriptions / 6 usage events / 4 invoices / 12 ledger rows
 global ledger sum 0.00, 0 idempotency keys
   Acme       AR=30.00  outstanding OPEN=30.00  PASS
   Globex     AR=36.67  outstanding OPEN=36.67  PASS
@@ -417,6 +429,16 @@ went `8 -> 12` rows globally (Acme `6 -> 10`). The stronger invariant —
 `sum(ACCOUNTS_RECEIVABLE)` equals outstanding `OPEN` — passes for every tenant,
 which is the check that catches what sum-to-zero misses. No demo payment has
 ever touched real seed data, deliberately.
+
+**Tenant count moved 4 → 6 on 2026-08-15, and this is expected.** Tenants `50`
+and `51`, both named `'string'`, were written by clicking **Try it out** on
+`POST /billing/tenants/` in the new Swagger UI — `'string'` is
+drf-spectacular's default example value. They are orphans: no subscription, no
+invoice, nothing references them. **Kept deliberately** as the evidence that the
+UI renders, submits and persists. Every other number in the block above is
+unchanged, and the ledger verification below still passes for all four real
+tenants. Contract verification against `pay_invoice` was done with `APIClient`
+inside a rolled-back `transaction.atomic()`, so it left no rows at all.
 
 Acme's next wake was recorded here as answering `PeriodNotEnded: Cannot make a
 bill for 2026-09-01 ... as the period has not ended`. **Stale as of 2026-08-13**
@@ -483,8 +505,8 @@ verified; prerequisite 2 is still blocked on data.**
 `is_active = False` means "no tenant can subscribe AND no billing is provided" —
 reading 2 — with mid-cycle deactivation resolved as (b), bill the final full
 period then cancel. BUILT AND VERIFIED 2026-08-12** — the serializer guard, the
-`generate_invoice` branch and the `DRAFT` drop are all in the working tree, with
-the live evidence recorded under "Start here next session". What follows is why
+`generate_invoice` branch and the `DRAFT` drop are all committed, with the live
+evidence recorded under "History — prerequisite 1" below. What follows is why
 the decision went this way; keep it, because the reasoning is not recoverable
 from the three lines of code it produced.
 
@@ -581,7 +603,7 @@ remaining item rather than going along with it.
 | 2 — Core endpoints | Create tenant → assign plan → record usage → generate correct invoice, all via API | **"Done when" met** (verified 2026-08-08) — full flow runs over HTTP. Auth layer, `generate_invoice`, and five endpoints done (tenant, plan, subscription, usage read+write, generate-invoice). Remaining cleanup, not blocking Phase 3: invoice/ledger read endpoints, pagination, narrowing the bare `except IntegrityError` |
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" in `docs/journal/phase-3.md`. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **"Done when" met** (verified 2026-08-14). Both prerequisites closed 2026-08-12/13; `generate_invoice_to_all`, the `generate_invoices` command, Redis, Celery worker and beat verified end to end 2026-08-13. 2026-08-14: beat schedule corrected to `crontab(minute='*/5')` and confirmed from beat's log, and `UsageIsolationTests` in `billing/tests.py` proves A's key returns only A's usage events — verified both green and red (mutation of `billing/views.py:59`). Remaining cleanup, not blocking Phase 5: write-isolation and 401 assertions, continuation past an errored tenant |
-| 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | **Next.** Test scaffolding exists as of 2026-08-14, so the two remaining required tests are assertions, not infrastructure: double-pay charges once, ledger sums to zero |
+| 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | **In progress, one item left.** 2026-08-15: all three required tests pass (`0965809` double-pay, `98b9ca5` ledger, isolation from Phase 4), and Swagger lists all 6 routes / 7 operations with auth and the `Idempotency-Key` header documented (`34a88d3`). **CI is the only remaining requirement**; lint ruleset decided (ruff `["F","E9"]`) |
 | 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | Blocked on 5 |
 | 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | Blocked on 6 (2026-08-09) |
 
@@ -596,6 +618,7 @@ directly:
 | `docs/journal/phase-2.md` | Phase 1 verification, `generate_invoice`, all five Phase 2 endpoints, negative money, zero-length periods, ordering, `__str__` |
 | `docs/journal/phase-3.md` | The double-charge repro, the `Idempotency-Key` claim, the two-curl proof, the decline/TTL contract, check ordering |
 | `docs/journal/phase-4.md` | The service loop, the `BillingError` skip contract, the management command, Redis/Celery/beat wiring, the eight traps hit, the end-to-end run, the beat-schedule correction, and the isolation test with its fixture and assertion shape |
+| `docs/journal/phase-5.md` | The double-pay and ledger tests with a mutation proof per assertion, the savepoint bug the double-pay test found, `BillingFixtureMixin` and MRO order, the Swagger wiring, and the live verification of all seven response codes |
 | `docs/journal/phase-7.md` | Horizontal-scale plan, the `migrate`-in-`CMD` blocker |
 
 The "Traps hit, worth not re-learning" lists were deleted on 2026-08-11. The
@@ -764,12 +787,46 @@ ledger write.
   so the `except` branch is needed regardless — and the pre-`get` makes the
   sequential path look correct while the concurrent path stays untested. React to
   the `IntegrityError`; do not try to predict it.
-- **The `get()` inside `except IntegrityError` only works in autocommit.** Inside
-  a `transaction.atomic()` block Postgres marks the transaction aborted and every
-  later query fails with `current transaction is aborted, commands ignored until
-  end of transaction block`. `ATOMIC_REQUESTS` is unset so this is currently
-  safe; do not wrap the claim in `atomic()` and do not enable `ATOMIC_REQUESTS`
-  without revisiting it.
+- **The `get()` inside `except IntegrityError` only works in autocommit —
+  FIXED 2026-08-15, keep reading for the mechanism.** Postgres marks the whole
+  transaction aborted on any `IntegrityError` and refuses every later statement
+  with `current transaction is aborted, commands ignored until end of
+  transaction block`. It survived in production only because autocommit makes
+  each statement its own transaction. `django.test.TestCase` wraps each test
+  method in one `atomic()` block, so the first replay test raised
+  `TransactionManagementError`. The claim `INSERT` is now inside its own
+  `with transaction.atomic():` (`services.py:166-170`) with the `except`
+  **outside** it: the inner block emits a `SAVEPOINT`, the exception leaving it
+  emits `ROLLBACK TO SAVEPOINT`, and the transaction is usable again. Only two
+  statements are accepted inside an aborted transaction — `ROLLBACK` and
+  `ROLLBACK TO SAVEPOINT`. **The `except` outside the `with` is load-bearing**:
+  the rewind is emitted by `atomic.__exit__`, so catching inside means it never
+  fires.
+- **`aggregate()` returns a dict, and `None` rather than `0` on an empty
+  match.** Two separate bugs in one line. Forgetting `['amount__sum']` compares
+  two *dicts*, which can pass for entirely the wrong reason. And after a payment
+  there are no `OPEN` invoices, so the outstanding aggregate is `None`, and
+  `None == Decimal('0')` is False. Use `Coalesce(Sum(...), Decimal('0'))` or an
+  explicit `is None` test — **not `or Decimal('0')`**, because `Decimal('0.00')`
+  is falsy, the same mechanism as the `Plan.clean()` bug below.
+- **`sum` is not `Sum`.** `aggregate(sum('amount'))` calls Python's builtin,
+  which iterates the string and dies on `unsupported operand type(s) for +:
+  'int' and 'str'` two frames from anything meaningful.
+- **Values captured before a write do not update after it.** A test that
+  computes its numbers, POSTs, then asserts on the captured numbers is asserting
+  about the pre-write state. It stays green if the POST is deleted entirely.
+  Recompute after the write.
+- **A subclass `setUp` replaces the parent's unless it calls `super().setUp()`,
+  silently.** A class listing a fixture mixin *and* defining its own `setUp`
+  runs only its own. The suite stays green if the override happens to build the
+  same fixtures, so the refactor looks done and is not. Related: mixins go
+  **first** in the bases list, or `unittest.TestCase`'s do-nothing `setUp` wins
+  and every test dies on a missing attribute.
+- **`INSTALLED_APPS` takes the module name, not the pip package name.**
+  `'drf-spectacular-sidecar'` with hyphens is `ModuleNotFoundError` at startup
+  and the container exits; `requirements.txt` wants the hyphens and
+  `INSTALLED_APPS` wants the underscores. Hit twice in one session. A container
+  that vanishes from `docker compose ps` needs `up -d`, not `restart`.
 - **A branch that neither returns nor raises keeps going.** Hit twice in one
   session. First: the `COMPLETED` arm was left empty, so a retry fell out of the
   `except` block into the status check and the gateway — reproduced live on
@@ -867,8 +924,18 @@ client error, not a replay.
 Keys are scoped per tenant. The same key string under two different tenants is
 allowed and must not collide.
 
-The Phase 3 deliverable is the two curl commands and their output. Capture them
-when the endpoint works; they are the demo.
+The Phase 3 deliverable is the two curl commands and their output, pasted in
+`docs/journal/phase-3.md`. They are the demo.
+
+**As of 2026-08-15 they are no longer the only proof.**
+`IdempotentPaymentTests.test_replay_returns_identical_response` asserts the same
+thing in code — two POSTs with one key, `response.content` compared as **bytes**
+(not `.data`, whose dict equality passes even when the two responses serialize
+differently), a `LedgerEntry` delta of exactly 2, and one `IdempotencyKey` row.
+Verified red by making the `COMPLETED` replay arm at `services.py:178` return a
+different body: both statuses stayed `200` while the contents diverged, which is
+precisely the stored-vs-returned bug this file already warns about. That is the
+assertion to keep if any get dropped.
 
 ## Testing conventions
 
@@ -879,8 +946,20 @@ SQLite, so tests must be run against Postgres to be trustworthy.
 
 The three required tests (Phase 5) map directly to Phase 1 shell checks:
 double-pay charges once, tenant A cannot read or affect tenant B, ledger sums
-to zero. The third is done — `UsageIsolationTests` in `billing/tests.py`,
-2026-08-14.
+to zero. **All three are done as of 2026-08-15** — `UsageIsolationTests`
+(2026-08-14), `IdempotentPaymentTests` (`0965809`) and `LedgerInvariantTests`
+(`98b9ca5`), all in `billing/tests.py`, sharing `BillingFixtureMixin` where the
+fixture story matches.
+
+The ledger test asserts **both** forms, before the payment and again after it:
+`sum(all) == 0`, and `sum(ACCOUNTS_RECEIVABLE) == outstanding OPEN`. Proven
+necessary rather than assumed — duplicating the invoicing pair in
+`generate_invoice` leaves sum-to-zero green (`+20 -20 +20 -20`) while the second
+assertion reads `Decimal('40.00') != Decimal('20.00')`.
+
+`billing/tests.py` is still a single module. Splitting it into a package was the
+plan once the ledger test landed; at four tests and ~150 lines it has not earned
+the split yet.
 
 Settled while writing that first test, and they apply to every test after it:
 
@@ -1137,6 +1216,19 @@ Needed before Phase 6 deploy:
 - `.env` holds real credentials and is gitignored, but `docker-compose.yml`
   references it through `${...}` interpolation, so a fresh clone has no database
   config. Phase 6's README needs to say which keys are required.
+- **Static files, new 2026-08-15 and now load-bearing.** The Swagger UI serves
+  its assets from `/static/drf_spectacular_sidecar/...`, which works today only
+  because `DEBUG=True` makes Django serve static files itself. Under
+  `DEBUG=False` nothing serves them and the docs render **blank** — the exact
+  failure the sidecar was added to prevent, arriving by a different route. Needs
+  `collectstatic` plus whitenoise or nginx, in the same change as the `DEBUG`
+  flip.
+- **Empty `ALLOWED_HOSTS` bit twice on 2026-08-15**, both times as a confusing
+  error rather than an obvious one: `/api/schema/` is unreachable by container
+  hostname (`400 Bad Request`, no explanation in the response), and `APIClient`
+  used outside the test runner is rejected with `DisallowedHost: Invalid
+  HTTP_HOST header: 'testserver'`. The Django test *runner* whitelists
+  `testserver`; a plain script does not.
 
 Schema and code cleanups:
 - Invoice period uniqueness is enforced on exact `period_start` / `period_end`
@@ -1190,6 +1282,19 @@ Schema and code cleanups:
 - `LedgerEntry.description` is still never set — both invoicing and payment write
   `''`. Now that there are two kinds of pair in the table, a readable line
   (`"payment for invoice 42"` vs the billing window) is worth more than it was.
+- **`SPECTACULAR_SETTINGS` has no `TITLE`, `DESCRIPTION` or `VERSION`**, so the
+  docs render as "Swagger" / `0.0.0`. Cosmetic, but it is the first thing anyone
+  opening the deployed URL sees.
+- **Only `pay` documents its `401`.** The other five endpoints sit behind the
+  same authenticator and list no `401` response. The security scheme is declared
+  globally so a reader can infer it; add `@extend_schema(responses={401: ...})`
+  per view if the docs should be uniformly complete.
+- **`RequestHashDiffers` is `422`, not `409`** (`exceptions.py:59`) — recorded
+  because the first draft of the Swagger `responses` dict put the
+  different-body case under 409. `409` on `pay` means "invoice is not OPEN" or
+  "payment already processing". Reaching `422` at all requires an **extra field**
+  in the body: with `amount` as the only real field, a different amount trips
+  `AmountMismatch` (400) at `services.py:162` before the key is claimed at `:166`.
 - **Orphaned `PROCESSING` idempotency rows.** Any raise after the claim commits
   strands a row that can never complete, and the `PROCESSING` arm then answers
   409 "still in flight" forever. See "Orphaned `PROCESSING` rows" in
@@ -1224,6 +1329,22 @@ docker compose down
 
 `docker compose config` validates the compose file and prints resolved `${...}`
 values without starting anything. Use it before every `up`.
+
+The API docs live at `http://localhost:8000/api/docs/` (UI) and
+`http://localhost:8000/api/schema/` (raw OpenAPI). Authorize with the **whole**
+header value — `Api-Key <key>`, prefix included — because the scheme is
+`apiKey` on `Authorization`, so Swagger UI sends verbatim what is typed.
+
+Check the schema without a browser:
+
+```
+docker compose exec web python manage.py spectacular --file /dev/null
+```
+
+Silence means zero warnings; it prints a summary only when there are warnings or
+errors. It introspects `urlpatterns` directly, so it passes even when the docs
+routes themselves are missing from `config/urls.py` — a clean run there is not
+evidence that `/api/docs/` serves.
 
 `migrate` runs automatically on container start (it is in the Dockerfile `CMD`
 chain), but it only **applies** files already in `billing/migrations/` — it never
