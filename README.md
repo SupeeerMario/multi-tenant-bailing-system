@@ -50,8 +50,8 @@ Business logic lives in `billing/services.py` as plain functions that take a `Te
 Requires Docker and Docker Compose.
 
 ```bash
-git clone git@github.com:SupeeerMario/multi-tenant-bailing-system.git
-cd multi-tenant-bailing-system
+git clone git@github.com:SupeeerMario/multi-tenant-billing-system.git
+cd multi-tenant-billing-system
 cp .env.example .env        # then fill it in — see Configuration
 docker compose up -d --build
 ```
@@ -330,8 +330,8 @@ The live instance runs this same `docker-compose.yml` on an Oracle Cloud server 
 
 ```bash
 ssh -i <private-key> ubuntu@<server-ip>
-git clone git@github.com:SupeeerMario/multi-tenant-bailing-system.git
-cd multi-tenant-bailing-system
+git clone git@github.com:SupeeerMario/multi-tenant-billing-system.git
+cd multi-tenant-billing-system
 # create .env here — it is gitignored, so the clone does not include it
 docker compose up -d --build
 ```

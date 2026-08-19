@@ -173,7 +173,10 @@ revisit that note asked for.
 
 `.github/workflows/ci.yml`, `on: push`, three jobs — `lint`, `test`,
 `docker-build`. Remote is
-`git@github.com:SupeeerMario/multi-tenant-bailing-system.git`. Lint config is
+`git@github.com:SupeeerMario/multi-tenant-billing-system.git` — renamed from
+`bailing` to `billing` on 2026-08-20. GitHub redirects the old URL, but that is
+a courtesy and not permanent; a stale `origin` prints
+`remote: This repository moved.` on every push. Lint config is
 `pyproject.toml` **at the repo root**.
 
 **Lint ruleset: ruff `0.16.3`, `select = ["F", "E9"]` only.** Bug rules —
