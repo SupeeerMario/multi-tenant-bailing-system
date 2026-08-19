@@ -33,6 +33,12 @@ DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
 ALLOWED_HOSTS = [h.strip() for h in os.getenv('ALLOWED_HOSTS', '').split(',') if h.strip()]
 
+# TLS is terminated by the reverse proxy in front of this app, so gunicorn only
+# ever sees plain HTTP. Without this header Django reports request.is_secure()
+# as False and builds http:// absolute URLs and redirects on an https site.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+CSRF_TRUSTED_ORIGINS = [o.strip() for o in os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',') if o.strip()]
+
 
 # Application definition
 
