@@ -18,7 +18,7 @@ Updated 2026-08-15.
 **Declared complete by the author on 2026-08-15.** Do not open this file looking
 for the next task — there isn't one unless Phase 7 is picked up deliberately.
 
-**Live:** `http://89.168.19.242:8000/api/docs/` — an Oracle Cloud server running
+**Live:** `https://multi-tenant-billing-app.duckdns.org/api/docs/` — an Oracle Cloud server running
 this repo's own `docker-compose.yml`. Deployed by SSH, `git clone`, a hand-placed
 `.env`, then `docker compose up -d --build`. No separate production compose file
 and no registry. **Ship changes by committing locally, pushing, then `git pull`
@@ -785,7 +785,7 @@ remaining item rather than going along with it.
 | 3 — Idempotent payments | Same payment request twice returns same result, charges once (save both curl commands + output) | **"Done when" met** (verified 2026-08-10) — gateway, `pay_invoice`, the pay endpoint, the header guard, `request_hash`, the claim `INSERT`, all four collision arms, and the stored-and-replayed decline are done and verified live. Two identical requests return byte-identical bodies and write one ledger pair. Both curls and their output are pasted in "The two-curl proof" in `docs/journal/phase-3.md`. Remaining cleanup, not blocking Phase 4: orphaned `PROCESSING` rows, `LedgerEntry.description` still `''`, `InvoicesPay`'s duplicate invoice lookup |
 | 4 — Multi-tenancy + worker | Worker generates invoices on a schedule; tenant isolation proven by a test | **"Done when" met** (verified 2026-08-14). Both prerequisites closed 2026-08-12/13; `generate_invoice_to_all`, the `generate_invoices` command, Redis, Celery worker and beat verified end to end 2026-08-13. 2026-08-14: beat schedule corrected to `crontab(minute='*/5')` and confirmed from beat's log, and `UsageIsolationTests` in `billing/tests.py` proves A's key returns only A's usage events — verified both green and red (mutation of `billing/views.py:59`). Remaining cleanup, not blocking Phase 5: write-isolation and 401 assertions, continuation past an errored tenant |
 | 5 — Tests + docs + CI | CI green on push (lint + tests + Docker build), Swagger lists every endpoint | **"Done when" met** (verified 2026-08-15). All three required tests pass (`0965809` double-pay, `98b9ca5` ledger, isolation from Phase 4); Swagger lists all 6 routes / 7 operations with auth and the `Idempotency-Key` header documented (`34a88d3`); `.github/workflows/ci.yml` green on push with `lint`, `test` and `docker-build`, ruff pinned at `0.16.3` with `select = ["F","E9"]`. Remaining cleanup, not blocking Phase 6: `SPECTACULAR_SETTINGS` `TITLE`/`VERSION`, `401` on the other five endpoints, usage write-isolation test |
-| 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | **Closed 2026-08-15 on the author's revised terms.** Live at `http://89.168.19.242:8000/api/docs/` on an Oracle Cloud server; README carries the mermaid diagram, the API walkthrough, the `.env` contract and the live no-double-charge proof with screenshots. **The decision note was skipped deliberately** — its content lives under "Open design decisions" in this file. Not an open task |
+| 6 — Deploy + package | Live URL, README with architecture diagram + no-double-charge proof, decision note | **Closed 2026-08-15 on the author's revised terms.** Live at `https://multi-tenant-billing-app.duckdns.org/api/docs/` on an Oracle Cloud server; README carries the mermaid diagram, the API walkthrough, the `.env` contract and the live no-double-charge proof with screenshots. **The decision note was skipped deliberately** — its content lives under "Open design decisions" in this file. Not an open task |
 | 7 — Horizontal scale | nginx in front of 2 identical web containers, one Postgres; the same-key retry proof rerun across containers, not threads | **Unblocked, not started, optional.** Outside the original six-phase spec. Considered for removal 2026-08-15 and kept. Prerequisites are already in place — `migrate` is a one-shot service and gunicorn is PID 1, the two things `phase-7.md` named as blockers |
 
 ## Build journal — not loaded by default
@@ -1412,7 +1412,7 @@ Deploy prerequisites — **all closed 2026-08-15**, kept for the mechanisms:
   from `entrypoint.sh` before gunicorn binds. **WhiteNoise indexes `STATIC_ROOT`
   once at startup**, so collecting after boot changes nothing until a restart.
 - ~~Empty `ALLOWED_HOSTS`~~ — set from the environment, and the deployed server
-  lists its public IP. It bit three times before that: `/api/schema/`
+  lists its domain, `multi-tenant-billing-app.duckdns.org`. It bit three times before that: `/api/schema/`
   unreachable by container hostname (`400`, no explanation), `APIClient` outside
   the test runner rejected with `DisallowedHost: Invalid HTTP_HOST header:
   'testserver'`, and the public IP rejected the same way. The Django test

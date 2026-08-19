@@ -4,10 +4,10 @@ A billing API built with Django and DRF. It charges companies on a monthly cycle
 
 Every movement of money is recorded as a double-entry ledger pair, and payments are made idempotent by a database constraint rather than an application-level check.
 
-**Live:** http://89.168.19.242:8000/api/docs/
+**Live:** https://multi-tenant-billing-app.duckdns.org/api/docs/
 
 > [!NOTE]
-> The live instance is a demo. It serves plain HTTP with no TLS, API keys are stored in plaintext, and the tenant/plan creation endpoints are open. Each is a deliberate simplification, not an oversight.
+> The live instance is a demo. API keys are stored in plaintext and the tenant/plan creation endpoints are open. Each is a deliberate simplification, not an oversight.
 
 ## Features
 
@@ -168,7 +168,7 @@ This is the point of the project. The same payment request is sent twice with th
 **Both requests, identical:**
 
 ```bash
-curl -X POST 'http://89.168.19.242:8000/billing/invoices/1/pay/' \
+curl -X POST 'https://multi-tenant-billing-app.duckdns.org/billing/invoices/1/pay/' \
   -H 'Idempotency-Key: dummy_key' \
   -H 'Authorization: Api-Key <key>' \
   -H 'Content-Type: application/json' \
